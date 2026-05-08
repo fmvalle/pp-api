@@ -1,5 +1,6 @@
 from uuid import UUID
 
+import anyio
 from fastapi import HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -14,6 +15,7 @@ from app.domains.auth.service import (
     switch_session_active_profile,
     verify_firebase_id_token,
 )
+from app.v1.auth.firebase_identity_password import fetch_firebase_id_token_from_password
 from app.v1.auth.schemas import (
     AuthContextResponseV1,
     FirebaseExchangeResponseV1,
@@ -72,6 +74,19 @@ async def firebase_exchange_v1(db: AsyncSession, id_token: str) -> FirebaseExcha
         bootstrap_token=bt,
         context=ctx,
     )
+
+
+async def firebase_sign_in_with_password_v1(
+    db: AsyncSession, email: str, password: str
+) -> FirebaseExchangeResponseV1:
+    """Email+senha → Identity Toolkit → id_token → mesmo fluxo que `firebase/exchange`."""
+    web_key = (settings.firebase_web_api_key or "").strip()
+    id_token = await anyio.to_thread.run_sync(
+        lambda: fetch_firebase_id_token_from_password(
+            email=email, password=password, web_api_key=web_key
+        ),
+    )
+    return await firebase_exchange_v1(db, id_token)
 
 
 async def select_profile_v1(

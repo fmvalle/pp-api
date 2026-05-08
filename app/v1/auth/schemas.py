@@ -25,6 +25,23 @@ class SessionContextOut(BaseModel):
     school_id: UUID | None = None
 
 
+class SignInRequestV1(BaseModel):
+    """Corpo para `POST /v1/auth/sign-in` (compatível com fluxos tipo MIA: email + senha na API)."""
+
+    email: str = Field(..., min_length=3, max_length=320)
+    password: str = Field(..., min_length=1, max_length=4096)
+
+    @field_validator("email", mode="before")
+    @classmethod
+    def strip_email(cls, v: object) -> object:
+        return v.strip() if isinstance(v, str) else v
+
+    @field_validator("password", mode="before")
+    @classmethod
+    def strip_password(cls, v: object) -> object:
+        return v.strip() if isinstance(v, str) else v
+
+
 class FirebaseExchangeRequestV1(BaseModel):
     id_token: str = Field(..., min_length=10)
 

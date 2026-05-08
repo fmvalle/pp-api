@@ -62,6 +62,10 @@ class Settings(BaseSettings):
         default=None,
         description="PEM RSA da service account; use \\n literais se a env for uma linha só.",
     )
+    firebase_web_api_key: str | None = Field(
+        default=None,
+        description="Chave Web do Firebase (Identity Toolkit) para POST /v1/auth/sign-in com email+senha.",
+    )
     firebase_check_revoked: bool = Field(
         default=False,
         description="Se true, verify_id_token consulta revogação (mais lento; pode falhar sem permissões).",

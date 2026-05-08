@@ -57,6 +57,8 @@ Resposta esperada **com código actual** (exemplo):
 - Se receber **apenas** `{"status":"ok"}` **com** `?firebase=1` na URL → a imagem em Cloud Run **ainda não inclui** este endpoint (falta **build + deploy** do repositório `api`).
 - Use `credential_branch` e `path_is_file` / `private_key_looks_like_pem` para ver qual ramo o `init_firebase` usa e se o ficheiro PEM existe / está bem formatado (sem expor segredos).
 
+**Postman:** coleções em `pp-bo/postman/` (`PP-API-v1.postman_collection.json`, `PP-API.postman_collection.json`) incluem `GET /health?firebase=1` e a descrição da coleção aponta para `/docs` e importação via `/openapi.json`.
+
 Se `/health` responder mas o login falhar, vê os logs: costuma ser `FIREBASE_CREDENTIALS_JSON`, `FIREBASE_CREDENTIALS_PATH` ou `GOOGLE_APPLICATION_CREDENTIALS` em falta ou inválido.
 
 ### Login 401 (“Token inválido ou service account de outro projeto”)
@@ -95,7 +97,7 @@ Se o ficheiro **não existir**, o Admin SDK falha ao abrir o caminho e o login d
 
 **URL do serviço:** a região é `us-central1` (com **um** “l”), por exemplo `…us-central1.run.app`. `us-centrall` não é o host correcto.
 
-**Nota:** `FIREBASE_WEB_API_KEY` (chave Web do cliente) **não** é usada pela API para validar ID tokens; só interessam `FIREBASE_PROJECT_ID` e credenciais de **service account** (JSON ou `FIREBASE_CLIENT_EMAIL` + `FIREBASE_PRIVATE_KEY`). Sem isso, o Cloud Run pode cair em `GOOGLE_APPLICATION_CREDENTIALS` por defeito (conta do projeto GCP), que **não** valida tokens do Firebase `parametro-pedagogico` → 401 genérico.
+**Nota:** `FIREBASE_WEB_API_KEY` (chave Web do mesmo projeto Firebase) é usada para **`POST /v1/auth/sign-in`** / **`POST /api/v1/auth/sign-in`** (email+senha → Identity Toolkit). **Não** substitui a service account Admin: `FIREBASE_PROJECT_ID` + JSON / `FIREBASE_CLIENT_EMAIL` + `FIREBASE_PRIVATE_KEY` continuam necessários para **validar** o `id_token` nas rotas que o usam. Sem credencial Admin, o Cloud Run pode cair em `GOOGLE_APPLICATION_CREDENTIALS` por defeito → 401 no login.
 
 ## Variáveis obrigatórias (mínimo)
 
