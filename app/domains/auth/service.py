@@ -51,7 +51,9 @@ def verify_firebase_id_token(id_token: str) -> dict:
         hint = (
             "Token inválido ou service account de outro projeto. "
             "Use o JSON de 'Contas de serviço' do mesmo Firebase do app (project_id compatível com "
-            f"{settings.firebase_project_id}). Ajuste FIREBASE_PROJECT_ID / FIREBASE_CREDENTIALS_PATH."
+            f"{settings.firebase_project_id}). Ajuste credenciais Admin: FIREBASE_CREDENTIALS_PATH / "
+            "FIREBASE_CREDENTIALS_JSON ou FIREBASE_CLIENT_EMAIL + FIREBASE_PRIVATE_KEY, e "
+            "FIREBASE_PROJECT_ID."
         )
         detail = f"{hint} ({exc!s})" if settings.api_debug else hint
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail) from exc

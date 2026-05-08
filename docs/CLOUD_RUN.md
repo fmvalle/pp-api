@@ -50,8 +50,35 @@ O cliente (Flutter) já emitiu o token para o `FIREBASE_PROJECT_ID` certo; o 401
 2. **Credencial:** tem de ser o JSON **“Gerar nova chave privada”** em Firebase Console → Definições do projeto → **Contas de serviço** (Admin SDK), não um JSON aleatório de outro projeto GCP.
 3. No JSON, o campo **`project_id`** tem de ser **igual** a `FIREBASE_PROJECT_ID` (a API valida isso no arranque do Admin SDK).
 4. Se usas `FIREBASE_CREDENTIALS_PATH=/secrets/firebase-admin.json`, o ficheiro tem de **existir no contentor** (secret montado como ficheiro, não pasta vazia). Se o caminho não existir, `verify_id_token` falha com a mensagem genérica acima.
-5. **Ordem de precedência** (`app/core/firebase.py`): `FIREBASE_CREDENTIALS_PATH` vence `FIREBASE_CREDENTIALS_JSON` e `GOOGLE_APPLICATION_CREDENTIALS`. Se `FIREBASE_CREDENTIALS_PATH` aponta para um ficheiro errado ou inexistente, corrige ou remove essa variável para testar outra fonte.
+5. **Ordem de precedência** (`app/core/firebase.py`): `FIREBASE_CREDENTIALS_PATH` → `FIREBASE_CREDENTIALS_JSON` → **`FIREBASE_CLIENT_EMAIL` + `FIREBASE_PRIVATE_KEY`** (mesmo padrão que Directus) → `GOOGLE_APPLICATION_CREDENTIALS`. Se `FIREBASE_CREDENTIALS_PATH` aponta para um ficheiro errado ou inexistente, **remove-a** para a API usar JSON ou email+PEM.
 6. Nos **logs** da revisão, procura `verify_firebase_id_token falhou` — aí aparece o tipo e a mensagem real da exceção (ex.: ficheiro em falta, `project_id` divergente, token expirado). Em desenvolvimento podes definir `API_DEBUG=true` para o detalhe ir também no corpo HTTP do 401.
+
+### Cloud Run: `FIREBASE_CREDENTIALS_PATH` sozinho não basta
+
+Na consola, **“Variáveis e segredos”** com `FIREBASE_CREDENTIALS_PATH=/secrets/firebase-admin.json` **não grava o JSON em lado nenhum**. O contentor só tem esse ficheiro se:
+
+- montares um **volume** (Secret Manager) nesse caminho, **ou**
+- usares outra fonte (ex.: `FIREBASE_CREDENTIALS_JSON` vinda de secret referenciado na variável).
+
+Se o ficheiro **não existir**, o Admin SDK falha ao abrir o caminho e o login devolve o 401 genérico (“service account de outro projeto…”), mesmo com `FIREBASE_PROJECT_ID` correcto.
+
+**Opção recomendada (menos confusão com caminhos):**
+
+1. No **Secret Manager**, cria um secret (ex.: `pp-api-firebase-admin-json`) cuja **versão** é o conteúdo **exacto** do ficheiro JSON gerado no Firebase (Admin SDK → nova chave privada). O campo `"project_id"` dentro do JSON deve ser `parametro-pedagogico`.
+2. Na revisão do **pp-api** → variáveis de ambiente:
+   - **Remove** `FIREBASE_CREDENTIALS_PATH` (importante: o código tenta o **path primeiro**; se ficar apontando para um ficheiro inexistente, ignora o JSON).
+   - Adiciona `FIREBASE_CREDENTIALS_JSON` com valor **“Referência do Secret Manager”** (ou equivalente na UI) apontando para esse secret/versão.
+3. Mantém `FIREBASE_PROJECT_ID=parametro-pedagogico`.
+4. Implanta nova revisão e testa o login.
+
+**Opção com ficheiro em `/secrets/…`:**
+
+1. Secret Manager com o mesmo JSON.
+2. Na revisão → separador do **contentor** → **Volumes** → adicionar volume (tipo Secret) + **montagem** no contentor de modo a existir um **ficheiro** em `/secrets/firebase-admin.json` (o nome do ficheiro montado depende da UI; se o Cloud Run criar outro nome, ajusta `FIREBASE_CREDENTIALS_PATH` para esse caminho **real** dentro do contentor, ou usa a opção com `FIREBASE_CREDENTIALS_JSON` acima).
+
+**URL do serviço:** a região é `us-central1` (com **um** “l”), por exemplo `…us-central1.run.app`. `us-centrall` não é o host correcto.
+
+**Nota:** `FIREBASE_WEB_API_KEY` (chave Web do cliente) **não** é usada pela API para validar ID tokens; só interessam `FIREBASE_PROJECT_ID` e credenciais de **service account** (JSON ou `FIREBASE_CLIENT_EMAIL` + `FIREBASE_PRIVATE_KEY`). Sem isso, o Cloud Run pode cair em `GOOGLE_APPLICATION_CREDENTIALS` por defeito (conta do projeto GCP), que **não** valida tokens do Firebase `parametro-pedagogico` → 401 genérico.
 
 ## Variáveis obrigatórias (mínimo)
 

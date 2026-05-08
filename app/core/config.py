@@ -53,6 +53,15 @@ class Settings(BaseSettings):
         default="parametro-pedagogico",
         description="Project ID do Firebase que emite os ID tokens (deve bater com o app cliente).",
     )
+    firebase_client_email: str | None = Field(
+        default=None,
+        description="Email da service account (ex.: firebase-adminsdk-…@proj.iam.gserviceaccount.com); "
+        "com FIREBASE_PRIVATE_KEY substitui JSON/path (estilo Directus / Cloud Run).",
+    )
+    firebase_private_key: str | None = Field(
+        default=None,
+        description="PEM RSA da service account; use \\n literais se a env for uma linha só.",
+    )
     firebase_check_revoked: bool = Field(
         default=False,
         description="Se true, verify_id_token consulta revogação (mais lento; pode falhar sem permissões).",
