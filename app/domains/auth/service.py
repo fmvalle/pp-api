@@ -40,6 +40,11 @@ def verify_firebase_id_token(id_token: str) -> dict:
         return decoded
     except HTTPException:
         raise
+    except RuntimeError as exc:
+        # Credenciais Admin em falta ou PEM inválido — não confundir com token de utilizador inválido.
+        if str(exc).startswith("Firebase Admin:"):
+            raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
+        raise
     except Exception as exc:  # noqa: BLE001
         # Resposta HTTP continua genérica; o motivo real fica nos logs do servidor (Cloud Run / uvicorn).
         _log.warning(

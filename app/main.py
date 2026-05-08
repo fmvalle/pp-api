@@ -202,6 +202,18 @@ async def handle_validation_exception(_: Request, exc: RequestValidationError):
 
 @app.exception_handler(Exception)
 async def handle_unexpected_exception(_: Request, exc: Exception):
+    # RuntimeError é subclasse de Exception: tratar aqui (handlers só por tipo exacto não bastam).
+    if isinstance(exc, RuntimeError) and str(exc).startswith("Firebase Admin:"):
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={
+                "error": {
+                    "code": 503,
+                    "type": "firebase_config_error",
+                    "message": str(exc),
+                }
+            },
+        )
     msg = str(exc) if settings.api_debug else "Unexpected internal error"
     return JSONResponse(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

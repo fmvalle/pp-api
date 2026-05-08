@@ -70,16 +70,18 @@ def init_firebase() -> None:
 
     opts = {"projectId": settings.firebase_project_id}
 
-    if settings.firebase_credentials_path:
-        with open(settings.firebase_credentials_path, "r", encoding="utf-8") as f:
+    cred_path = (settings.firebase_credentials_path or "").strip()
+    if cred_path:
+        with open(cred_path, "r", encoding="utf-8") as f:
             info = json.load(f)
         _validate_project_id(info.get("project_id"))
         cred = credentials.Certificate(info)
         firebase_admin.initialize_app(cred, opts)
         return
 
-    if settings.firebase_credentials_json:
-        info = json.loads(settings.firebase_credentials_json)
+    cred_json = (settings.firebase_credentials_json or "").strip()
+    if cred_json:
+        info = json.loads(cred_json)
         _validate_project_id(info.get("project_id"))
         cred = credentials.Certificate(info)
         firebase_admin.initialize_app(cred, opts)
