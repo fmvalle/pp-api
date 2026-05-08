@@ -1,3 +1,4 @@
+import logging
 from datetime import datetime, timezone
 from uuid import UUID
 
@@ -17,6 +18,8 @@ from app.core.security import (
 from app.domains.auth import repository as repo
 from app.domains.auth.models import AppSession
 from app.domains.auth.schemas import AuthSessionResponse, ProfileOut, SessionOut, TokenPairResponse
+
+_log = logging.getLogger(__name__)
 
 
 def verify_firebase_id_token(id_token: str) -> dict:
@@ -38,6 +41,13 @@ def verify_firebase_id_token(id_token: str) -> dict:
     except HTTPException:
         raise
     except Exception as exc:  # noqa: BLE001
+        # Resposta HTTP continua genérica; o motivo real fica nos logs do servidor (Cloud Run / uvicorn).
+        _log.warning(
+            "verify_firebase_id_token falhou (%s): %s",
+            type(exc).__name__,
+            exc,
+            exc_info=True,
+        )
         hint = (
             "Token inválido ou service account de outro projeto. "
             "Use o JSON de 'Contas de serviço' do mesmo Firebase do app (project_id compatível com "

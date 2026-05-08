@@ -42,6 +42,17 @@ O Firebase Admin **não** bloqueia mais o arranque: inicializa na primeira rota 
 
 Se `/health` responder mas o login falhar, vê os logs: costuma ser `FIREBASE_CREDENTIALS_JSON`, `FIREBASE_CREDENTIALS_PATH` ou `GOOGLE_APPLICATION_CREDENTIALS` em falta ou inválido.
 
+### Login 401 (“Token inválido ou service account de outro projeto”)
+
+O cliente (Flutter) já emitiu o token para o `FIREBASE_PROJECT_ID` certo; o 401 vem do **Admin SDK na revisão Cloud Run** ao validar o token.
+
+1. **Revisão → Variáveis de ambiente:** `FIREBASE_PROJECT_ID` = o mesmo ID do Firebase do app (ex.: `parametro-pedagogico`), sem espaços nem aspas a mais.
+2. **Credencial:** tem de ser o JSON **“Gerar nova chave privada”** em Firebase Console → Definições do projeto → **Contas de serviço** (Admin SDK), não um JSON aleatório de outro projeto GCP.
+3. No JSON, o campo **`project_id`** tem de ser **igual** a `FIREBASE_PROJECT_ID` (a API valida isso no arranque do Admin SDK).
+4. Se usas `FIREBASE_CREDENTIALS_PATH=/secrets/firebase-admin.json`, o ficheiro tem de **existir no contentor** (secret montado como ficheiro, não pasta vazia). Se o caminho não existir, `verify_id_token` falha com a mensagem genérica acima.
+5. **Ordem de precedência** (`app/core/firebase.py`): `FIREBASE_CREDENTIALS_PATH` vence `FIREBASE_CREDENTIALS_JSON` e `GOOGLE_APPLICATION_CREDENTIALS`. Se `FIREBASE_CREDENTIALS_PATH` aponta para um ficheiro errado ou inexistente, corrige ou remove essa variável para testar outra fonte.
+6. Nos **logs** da revisão, procura `verify_firebase_id_token falhou` — aí aparece o tipo e a mensagem real da exceção (ex.: ficheiro em falta, `project_id` divergente, token expirado). Em desenvolvimento podes definir `API_DEBUG=true` para o detalhe ir também no corpo HTTP do 401.
+
 ## Variáveis obrigatórias (mínimo)
 
 - `DATABASE_URL` (asyncpg), ex.: `postgresql+asyncpg://USER:PASS@HOST:5432/DBNAME`
