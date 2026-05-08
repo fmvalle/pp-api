@@ -1,5 +1,8 @@
 .env
 .venv/
+# JSON do Firebase Admin SDK (cópia local; nunca commitar)
+secrets/*
+!secrets/.gitkeep
 venv/
 __pycache__/
 *.py[cod]

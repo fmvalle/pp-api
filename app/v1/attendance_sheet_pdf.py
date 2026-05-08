@@ -1,4 +1,8 @@
-"""Geração de PDF da lista de presença (cabeçalho + tabela com assinatura)."""
+"""Geração de PDF da lista de presença (cabeçalho + tabela com assinatura).
+
+Imports do ReportLab são lazy dentro de `build_attendance_sheet_pdf_bytes` para não
+atrasar o arranque do contentor (ex.: Cloud Run / health na PORT).
+"""
 
 from __future__ import annotations
 
@@ -6,14 +10,6 @@ import json
 from datetime import datetime
 from io import BytesIO
 from typing import Any
-
-from reportlab.lib import colors
-from reportlab.lib.pagesizes import A4
-from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
-from reportlab.lib.units import cm
-from reportlab.graphics.barcode import qr
-from reportlab.graphics.shapes import Drawing
-from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
 
 def _fmt_dt(iso_val: Any) -> str:
@@ -66,6 +62,14 @@ def build_attendance_sheet_pdf_bytes(
     students: list[dict[str, Any]],
 ) -> bytes:
     """Monta PDF A4 em memória."""
+    from reportlab.graphics.barcode import qr
+    from reportlab.graphics.shapes import Drawing
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+    from reportlab.lib.units import cm
+    from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+
     buf = BytesIO()
     doc = SimpleDocTemplate(
         buf,
