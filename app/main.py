@@ -7,7 +7,6 @@ from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from app.core.config import settings
-from app.core.firebase import init_firebase
 from app.domains.auth.router import router as auth_router
 from app.domains.me.router import router as me_router
 from app.v1.router import router as v1_router
@@ -15,7 +14,7 @@ from app.v1.router import router as v1_router
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    init_firebase()
+    # Firebase inicializa em lazy (ensure_firebase_initialized) na primeira rota que precise.
     yield
 
 

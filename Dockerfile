@@ -10,7 +10,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
 
-# Cloud Run injeta PORT (muito comum 8080). Em Docker local sem PORT, mantém 8000.
+COPY docker-entrypoint.sh /docker-entrypoint.sh
+RUN chmod +x /docker-entrypoint.sh
+
+# Cloud Run usa a variável PORT; o entrypoint lê-a em runtime.
 EXPOSE 8080
 
-CMD ["sh", "-c", "exec uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
+ENTRYPOINT ["/docker-entrypoint.sh"]

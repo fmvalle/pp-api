@@ -7,6 +7,15 @@ from firebase_admin import credentials
 from app.core.config import settings
 
 
+def ensure_firebase_initialized() -> None:
+    """Garante Admin SDK antes de auth.verify_id_token / create_user / etc.
+
+    Chamado de forma lazy para o contentor aceitar tráfego (ex. /health no Cloud Run)
+    mesmo que credenciais Firebase falhem só em rotas que precisam delas.
+    """
+    init_firebase()
+
+
 def init_firebase() -> None:
     if firebase_admin._apps:
         return

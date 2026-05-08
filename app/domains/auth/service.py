@@ -7,6 +7,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
+from app.core.firebase import ensure_firebase_initialized
 from app.core.security import (
     create_access_token,
     hash_refresh_token,
@@ -23,6 +24,7 @@ def verify_firebase_id_token(id_token: str) -> dict:
     if not token:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Missing Firebase id_token")
     try:
+        ensure_firebase_initialized()
         decoded = firebase_auth.verify_id_token(token, check_revoked=settings.firebase_check_revoked)
         aud = decoded.get("aud")
         iss = decoded.get("iss")

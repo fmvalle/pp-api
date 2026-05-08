@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field, model_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.deps import AuthContext, get_auth_context
+from app.core.firebase import ensure_firebase_initialized
 from app.db.session import get_db
 from app.v1._academic_year import resolve_academic_year_id
 from app.v1._paging import PageArgs, paged_response, pagination_params
@@ -108,6 +109,7 @@ async def _create_user_with_profile(
     firebase_uid = None
     if body.create_firebase_user:
         try:
+            ensure_firebase_initialized()
             kwargs = {"email": body.email, "display_name": body.full_name}
             if body.temporary_password:
                 kwargs["password"] = body.temporary_password
@@ -293,6 +295,7 @@ async def delete_user_v1(
         await execute(db, "DELETE FROM people WHERE id = CAST(:pid AS uuid)", {"pid": str(row["person_id"])})
         if row.get("firebase_uid"):
             try:
+                ensure_firebase_initialized()
                 firebase_auth.delete_user(str(row["firebase_uid"]))
             except Exception:  # noqa: BLE001
                 pass
@@ -326,6 +329,7 @@ async def patch_user_email_v1(
     )
     if row.get("firebase_uid"):
         try:
+            ensure_firebase_initialized()
             firebase_auth.update_user(str(row["firebase_uid"]), email=body.email)
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(status.HTTP_409_CONFLICT, f"Falha ao atualizar e-mail no Firebase: {exc!s}") from exc
@@ -354,6 +358,7 @@ async def post_user_password_reset_v1(
         raise HTTPException(status.HTTP_404_NOT_FOUND, "User/profile not found")
     if not row.get("firebase_uid"):
         raise HTTPException(status.HTTP_409_CONFLICT, "Usuário sem firebase_uid")
+    ensure_firebase_initialized()
     if body.new_password:
         firebase_auth.update_user(str(row["firebase_uid"]), password=body.new_password)
         return {"ok": True, "mode": "set_password"}
