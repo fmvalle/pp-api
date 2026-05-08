@@ -115,3 +115,48 @@ def _validate_project_id(credential_project_id: str | None) -> None:
             "Firebase Admin: project_id divergente entre credencial e configuração. "
             f"credential.project_id={credential_project_id} != FIREBASE_PROJECT_ID={settings.firebase_project_id}"
         )
+
+
+def firebase_credential_diagnostic() -> dict[str, object]:
+    """Resumo **sem segredos** para depuração (`GET /health?firebase=1`).
+
+    Replica a ordem de `init_firebase`: path → JSON → email+PEM → GOOGLE_APPLICATION_CREDENTIALS.
+    """
+    pid = (settings.firebase_project_id or "").strip()
+    path = (settings.firebase_credentials_path or "").strip()
+    js = (settings.firebase_credentials_json or "").strip()
+    email = (settings.firebase_client_email or "").strip()
+    raw_pk = (settings.firebase_private_key or "").strip()
+    gac = (os.environ.get("GOOGLE_APPLICATION_CREDENTIALS") or "").strip()
+
+    out: dict[str, object] = {
+        "firebase_project_id": pid or None,
+        "api_supports_env_pem": True,
+    }
+
+    if path:
+        out["credential_branch"] = "FIREBASE_CREDENTIALS_PATH"
+        out["path"] = path
+        out["path_is_file"] = os.path.isfile(path)
+        return out
+    if js:
+        out["credential_branch"] = "FIREBASE_CREDENTIALS_JSON"
+        out["json_length_chars"] = len(js)
+        return out
+    if email or raw_pk:
+        out["credential_branch"] = "FIREBASE_CLIENT_EMAIL_AND_PRIVATE_KEY"
+        out["has_client_email"] = bool(email)
+        out["has_private_key"] = bool(raw_pk)
+        pk_norm = _normalize_firebase_private_key(raw_pk) if raw_pk else ""
+        out["private_key_looks_like_pem"] = bool(
+            pk_norm and "BEGIN PRIVATE KEY" in pk_norm and "END PRIVATE KEY" in pk_norm
+        )
+        return out
+    if gac:
+        out["credential_branch"] = "GOOGLE_APPLICATION_CREDENTIALS"
+        out["path"] = gac
+        out["path_is_file"] = os.path.isfile(gac)
+        return out
+
+    out["credential_branch"] = "none"
+    return out

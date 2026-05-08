@@ -40,6 +40,23 @@ Recomendações na revisão Cloud Run: **≥512 MiB** de memória, **1 vCPU** se
 
 O Firebase Admin **não** bloqueia mais o arranque: inicializa na primeira rota que precisa (login, criação de utilizador com Firebase, etc.). Assim o revision fica **Ready** mesmo que corrijas credenciais depois.
 
+### Confirmar que a revisão Cloud Run tem a **imagem mais recente** da API
+
+Se o erro de login ainda menciona **só** `FIREBASE_CREDENTIALS_PATH` (texto antigo) ou o diagnóstico abaixo não aparece, a revisão em produção **não** foi actualizada com o último código.
+
+```bash
+curl -sS 'https://SEU-SERVICO.run.app/health?firebase=1'
+```
+
+Resposta esperada **com código actual** (exemplo):
+
+```json
+{"status":"ok","firebase":{"firebase_project_id":"parametro-pedagogico","api_supports_env_pem":true,"credential_branch":"FIREBASE_CLIENT_EMAIL_AND_PRIVATE_KEY","has_client_email":true,"has_private_key":true,"private_key_looks_like_pem":true}}
+```
+
+- Se receber **apenas** `{"status":"ok"}` **com** `?firebase=1` na URL → a imagem em Cloud Run **ainda não inclui** este endpoint (falta **build + deploy** do repositório `api`).
+- Use `credential_branch` e `path_is_file` / `private_key_looks_like_pem` para ver qual ramo o `init_firebase` usa e se o ficheiro PEM existe / está bem formatado (sem expor segredos).
+
 Se `/health` responder mas o login falhar, vê os logs: costuma ser `FIREBASE_CREDENTIALS_JSON`, `FIREBASE_CREDENTIALS_PATH` ou `GOOGLE_APPLICATION_CREDENTIALS` em falta ou inválido.
 
 ### Login 401 (“Token inválido ou service account de outro projeto”)

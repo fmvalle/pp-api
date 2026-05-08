@@ -1,12 +1,13 @@
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Request, status
+from fastapi import FastAPI, HTTPException, Query, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from app.core.config import settings
+from app.core.firebase import firebase_credential_diagnostic
 from app.domains.auth.router import router as auth_router
 from app.domains.me.router import router as me_router
 from app.v1.router import router as v1_router
@@ -59,8 +60,16 @@ app.include_router(v1_router, prefix="/v1")
 
 
 @app.get("/health")
-async def health():
-    return {"status": "ok"}
+async def health(
+    firebase: int | None = Query(
+        default=None,
+        description="Use 1 para um resumo da config Firebase Admin (sem segredos).",
+    ),
+):
+    out: dict = {"status": "ok"}
+    if firebase == 1:
+        out["firebase"] = firebase_credential_diagnostic()
+    return out
 
 
 @app.exception_handler(HTTPException)
