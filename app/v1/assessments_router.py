@@ -790,9 +790,15 @@ async def get_schedule_roster_v1(
     attendance = await fetch_all(
         db,
         """
-        SELECT * FROM assessment_attendance_list
-        WHERE assessment_schedules_id = CAST(:sid AS uuid)
-        ORDER BY id ASC
+        SELECT
+          aal.*,
+          p2.full_name AS student_full_name,
+          p2.email AS student_email
+        FROM assessment_attendance_list aal
+        LEFT JOIN profiles p ON p.id = aal.student_id
+        LEFT JOIN people p2 ON p2.id = p.person_id
+        WHERE aal.assessment_schedules_id = CAST(:sid AS uuid)
+        ORDER BY aal.id ASC
         """,
         {"sid": str(schedule_id)},
     )
@@ -897,12 +903,28 @@ async def list_attendance_v1(
     pg: Annotated[PageArgs, Depends(pagination_params)] = PageArgs(1, 50),
 ):
     await get_schedule_v1(schedule_id, ctx, db, academic_year_id=academic_year_id)
-    sql = "SELECT * FROM assessment_attendance_list WHERE assessment_schedules_id = CAST(:id AS uuid)"
     params = {"id": str(schedule_id)}
-    count_row = await fetch_one(db, f"SELECT COUNT(*)::int AS total FROM ({sql}) q", params)
+    attendance_from = """
+        FROM assessment_attendance_list aal
+        LEFT JOIN profiles p ON p.id = aal.student_id
+        LEFT JOIN people p2 ON p2.id = p.person_id
+        WHERE aal.assessment_schedules_id = CAST(:id AS uuid)
+    """
+    count_row = await fetch_one(
+        db,
+        f"SELECT COUNT(*)::int AS total {attendance_from}",
+        params,
+    )
     items = await fetch_all(
         db,
-        f"{sql} ORDER BY id DESC LIMIT {pg.per_page} OFFSET {pg.offset}",
+        f"""
+        SELECT
+          aal.*,
+          p2.full_name AS student_full_name,
+          p2.email AS student_email
+        {attendance_from}
+        ORDER BY aal.id DESC LIMIT {pg.per_page} OFFSET {pg.offset}
+        """,
         params,
     )
     return paged_response(page=pg.page, per_page=pg.per_page, total=(count_row or {}).get("total", 0), items=items)
