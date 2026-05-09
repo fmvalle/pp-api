@@ -760,7 +760,7 @@ async def get_schedule_roster_v1(
     db: Annotated[AsyncSession, Depends(get_db)],
     academic_year_id: UUID | None = Query(None, description="Ano letivo. Se omitido, usa is_primary=true."),
 ):
-    """Contexto do agendamento: schedule, turma, professores, alunos (vw_classroom_students) e presença."""
+    """Contexto do agendamento: schedule, turma, professores, alunos matriculados (classroom_students) e presença."""
     sch = await get_schedule_v1(schedule_id, ctx, db, academic_year_id=academic_year_id)
     cid = sch["classroom_id"]
     classroom = await fetch_one(db, "SELECT * FROM classrooms WHERE id = CAST(:id AS uuid)", {"id": str(cid)})
@@ -779,11 +779,20 @@ async def get_schedule_roster_v1(
     students = await fetch_all(
         db,
         """
-        SELECT DISTINCT ON (v.student_id)
-          v.classroom_id, v.student_id, v.code, v.full_name, v.email, v.metadata, v.teacher_id
-        FROM vw_classroom_students v
-        WHERE v.classroom_id = CAST(:cid AS uuid)
-        ORDER BY v.student_id, v.teacher_id
+        SELECT
+          cs.classroom_id,
+          cs.student_id,
+          p.code,
+          p2.full_name,
+          p2.email,
+          p2.metadata,
+          NULL::uuid AS teacher_id
+        FROM classroom_students cs
+        INNER JOIN profiles p ON p.id = cs.student_id
+        INNER JOIN people p2 ON p2.id = p.person_id
+        WHERE cs.classroom_id = CAST(:cid AS uuid)
+          AND p2.status = 'published'
+        ORDER BY p2.full_name NULLS LAST, cs.student_id
         """,
         {"cid": str(cid)},
     )
@@ -992,6 +1001,7 @@ async def _apply_attendance_upserts(
 ) -> list[Any]:
     out: list[Any] = []
     for up in updates:
+        explicit_code = (up.code or "").strip() or None
         row = await fetch_one(
             db,
             """
@@ -1003,10 +1013,7 @@ async def _apply_attendance_upserts(
               CAST(:st AS uuid),
               CAST(:status AS attendance_list),
               :just,
-              COALESCE(
-                :code,
-                'AUTO-' || SUBSTRING(MD5(:sid || ':' || :st) FROM 1 FOR 28)
-              )
+              :code
             )
             ON CONFLICT ON CONSTRAINT assessment_attendance_list_schedule_student_key
             DO UPDATE SET
@@ -1020,10 +1027,27 @@ async def _apply_attendance_upserts(
                 "st": str(up.student_id),
                 "status": up.status or "registered",
                 "just": up.justification,
-                "code": (up.code or "").strip() or None,
+                "code": explicit_code,
             },
         )
-        out.append(row)
+        if row is not None and explicit_code is None:
+            c = row.get("code")
+            if c is None or str(c).strip() == "":
+                updated = await fetch_one(
+                    db,
+                    """
+                    UPDATE assessment_attendance_list
+                    SET code = 'QR' || id::text
+                    WHERE id = CAST(:id AS bigint)
+                      AND (code IS NULL OR BTRIM(code::text) = '')
+                    RETURNING *
+                    """,
+                    {"id": row["id"]},
+                )
+                if updated is not None:
+                    row = updated
+        if row is not None:
+            out.append(row)
     return out
 
 

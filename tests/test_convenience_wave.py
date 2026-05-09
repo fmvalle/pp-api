@@ -35,7 +35,7 @@ async def test_schedule_roster_returns_expected_keys(monkeypatch):
         calls["n"] += 1
         if "classroom_teachers" in sql:
             return [{"teacher_id": uuid.uuid4()}]
-        if "vw_classroom_students" in sql:
+        if "vw_classroom_students" in sql or "FROM classroom_students cs" in sql:
             return [{"student_id": uuid.uuid4()}]
         if "assessment_attendance_list" in sql:
             return []
