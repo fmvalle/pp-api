@@ -2,6 +2,7 @@
 
 import logging
 import uuid
+from datetime import datetime
 from typing import Annotated, Any
 from uuid import UUID
 
@@ -580,12 +581,31 @@ WHERE 1=1
     return paged_response(page=pg.page, per_page=pg.per_page, total=(count_row or {}).get("total", 0), items=items)
 
 
+def _coerce_timestamptz(value: Any, *, field: str) -> datetime:
+    """asyncpg exige datetime para timestamptz; JSON envia ISO-8601 em string."""
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        s = value.strip().replace("Z", "+00:00")
+        try:
+            return datetime.fromisoformat(s)
+        except ValueError as e:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                f"{field} inválido: esperado ISO-8601 (ex.: …T…Z).",
+            ) from e
+    raise HTTPException(
+        status.HTTP_422_UNPROCESSABLE_ENTITY,
+        f"{field} deve ser string ISO-8601 ou datetime, recebido: {type(value).__name__}",
+    )
+
+
 class ScheduleCreate(BaseModel):
     assessment_id: UUID
     classroom_id: UUID
     scheduled_by: UUID
-    start_time: str
-    end_time: str
+    start_time: datetime
+    end_time: datetime
     school_id: UUID | None = None
 
 
@@ -802,10 +822,10 @@ async def patch_schedule_v1(
     params: dict[str, Any] = {"id": str(schedule_id)}
     if "start_time" in body and body["start_time"] is not None:
         sets.append("start_time = CAST(:st AS timestamptz)")
-        params["st"] = body["start_time"]
+        params["st"] = _coerce_timestamptz(body["start_time"], field="start_time")
     if "end_time" in body and body["end_time"] is not None:
         sets.append("end_time = CAST(:en AS timestamptz)")
-        params["en"] = body["end_time"]
+        params["en"] = _coerce_timestamptz(body["end_time"], field="end_time")
     if "classroom_id" in body and body["classroom_id"] is not None:
         classroom_row = await fetch_one(
             db,

@@ -112,6 +112,10 @@ Sem `DATABASE_URL` / `JWT_SECRET` / `REFRESH_TOKEN_PEPPER`, o Pydantic falha **a
 
 **Nota:** não há ficheiro `.env` dentro da imagem Docker; tudo tem de vir das **variáveis de ambiente / secrets** do serviço Cloud Run.
 
+## CORS (Flutter Web / “falha de rede” ao gravar)
+
+Com o **ava** no browser a falar com a API no Cloud Run, o cabeçalho **Origin** (ex.: `https://app.parametropedagogico.com`) tem de constar em **`CORS_ORIGINS`** como entrada **completa** (`scheme://host[:porta]`). Valores truncados ou inválidos (ex.: `https:` sem host) fazem o Chrome falhar o `fetch` com *Failed to fetch* — o cliente mostra erro de rede mesmo com a API e a base de dados saudáveis.
+
 ## Recursos
 
 Com `reportlab` e vários routers, o arranque pode ser pesado. Se ainda falhar por timeout, aumenta **CPU** da revisão (ex. 1 vCPU) e **memória** (≥512 MiB) e/ou **startup CPU boost** no Cloud Run.

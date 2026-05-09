@@ -131,7 +131,7 @@ class Settings(BaseSettings):
     def cors_origins_list(self) -> list[str]:
         raw: list[str] = []
         for o in self.cors_origins.split(","):
-            o = o.strip()
+            o = o.strip().rstrip("/")
             if not o or "*" in o:
                 continue
             raw.append(o)
