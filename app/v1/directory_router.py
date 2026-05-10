@@ -72,6 +72,8 @@ class UserPatchBody(BaseModel):
     metadata: str | None = None
     role: str | None = None
     school_id: UUID | None = None
+    neurotypical: bool | None = None
+    neurotypical_description: str | None = None
 
 
 async def _create_user_with_profile(
@@ -208,6 +210,26 @@ async def create_user_v1(
     return await _create_user_with_profile(db, body=body)
 
 
+async def _assert_user_row_readable(
+    db: AsyncSession,
+    ctx: AuthContext,
+    row: dict[str, Any],
+) -> None:
+    """Alinha com a listagem [list_users_v1]: admin global, staff por escola, ou própria pessoa."""
+    if str(row.get("person_id")) == str(ctx.person_id):
+        return
+    if is_admin_like(ctx.role):
+        return
+    if not is_staff_admin_role(ctx.role):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Fora do escopo")
+    sscope = await get_effective_school_scope(db, ctx)
+    eff = {str(x) for x in (sscope.get("effective_school_ids") or [])}
+    sid = row.get("school_id")
+    if sid is not None and str(sid) in eff:
+        return
+    raise HTTPException(status.HTTP_403_FORBIDDEN, "Fora do escopo")
+
+
 @router.get("/users/{user_id}")
 async def get_user_v1(
     user_id: UUID,
@@ -217,8 +239,7 @@ async def get_user_v1(
     row = await fetch_one(db, "SELECT * FROM vw_profiles WHERE id = CAST(:id AS uuid)", {"id": str(user_id)})
     if not row:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "User/profile not found")
-    if not is_admin_like(ctx.role) and str(row.get("person_id")) != str(ctx.person_id):
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Fora do escopo")
+    await _assert_user_row_readable(db, ctx, row)
     return row
 
 
@@ -250,6 +271,12 @@ async def patch_user_v1(
     if body.metadata is not None:
         sets_people.append("metadata = :metadata")
         p_params["metadata"] = body.metadata
+    if body.neurotypical is not None:
+        sets_people.append("neurotypical = CAST(:neurotypical AS boolean)")
+        p_params["neurotypical"] = body.neurotypical
+    if body.neurotypical_description is not None:
+        sets_people.append("neurotypical_description = :neurotypical_description")
+        p_params["neurotypical_description"] = body.neurotypical_description
     if sets_people:
         await execute(
             db,
