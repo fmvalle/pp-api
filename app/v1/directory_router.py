@@ -26,6 +26,29 @@ from app.v1._sql import execute, fetch_all, fetch_one
 
 router = APIRouter(tags=["v1-directory"])
 
+_ALLOWED_USER_ROLE_FILTERS = frozenset(
+    {"STUDENT", "TEACHER", "SCHOOL_ADMIN", "PLATFORM_ADMIN"}
+)
+
+
+def _normalize_role_filter_param(role: str | None) -> str | None:
+    """Converte query `role` (ex.: STUDENT) para rótulo [user_role] ou None."""
+    if role is None:
+        return None
+    r = str(role).strip().upper().replace("-", "_")
+    if not r:
+        return None
+    if r in ("ALUNO", "ESTUDANTE"):
+        r = "STUDENT"
+    if r == "PROFESSOR":
+        r = "TEACHER"
+    if r not in _ALLOWED_USER_ROLE_FILTERS:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            f"Papel inválido para filtro: {role!r}",
+        )
+    return r
+
 
 async def _student_scope_read(db: AsyncSession, ctx: AuthContext, student_id: UUID) -> dict[str, Any]:
     row = await fetch_one(db, "SELECT * FROM vw_profiles WHERE id = CAST(:id AS uuid)", {"id": str(student_id)})
@@ -164,9 +187,14 @@ async def list_users_v1(
     ctx: Annotated[AuthContext, Depends(get_auth_context)],
     db: Annotated[AsyncSession, Depends(get_db)],
     school_id: UUID | None = None,
+    role: str | None = Query(
+        None,
+        description="Filtrar por papel (STUDENT, TEACHER, SCHOOL_ADMIN, PLATFORM_ADMIN)",
+    ),
     pg: Annotated[PageArgs, Depends(pagination_params)] = PageArgs(1, 50),
 ):
-    """Lista consolidada via vw_profiles (admin: opcional school_id; demais: só própria pessoa)."""
+    """Lista consolidada via vw_profiles (admin: opcional school_id e role; demais: escopo escola/self)."""
+    role_filter = _normalize_role_filter_param(role)
     sscope = await get_effective_school_scope(db, ctx)
     if is_admin_like(ctx.role):
         sql = "SELECT * FROM vw_profiles WHERE 1=1"
@@ -175,6 +203,9 @@ async def list_users_v1(
             subtree = await get_descendant_school_ids(db, school_id)
             sql += " AND school_id = ANY(CAST(:subtree AS uuid[]))"
             params["subtree"] = [str(x) for x in subtree]
+        if role_filter is not None:
+            sql += " AND role = CAST(:role_filter AS user_role)"
+            params["role_filter"] = role_filter
         count_row = await fetch_one(db, f"SELECT COUNT(*)::int AS total FROM ({sql}) q", params)
         items = await fetch_all(
             db,
@@ -191,6 +222,9 @@ async def list_users_v1(
     else:
         sql += " AND person_id = CAST(:pid AS uuid)"
         params["pid"] = str(ctx.person_id)
+    if role_filter is not None:
+        sql += " AND role = CAST(:role_filter AS user_role)"
+        params["role_filter"] = role_filter
     count_row = await fetch_one(db, f"SELECT COUNT(*)::int AS total FROM ({sql}) q", params)
     items = await fetch_all(
         db,
