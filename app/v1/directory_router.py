@@ -31,6 +31,15 @@ _ALLOWED_USER_ROLE_FILTERS = frozenset(
 )
 
 
+def _role_is_student(role: str | None) -> bool:
+    if not role:
+        return False
+    r = str(role).strip().upper().replace("-", "_")
+    if r in ("ALUNO", "ESTUDANTE"):
+        r = "STUDENT"
+    return r == "STUDENT"
+
+
 def _normalize_role_filter_param(role: str | None) -> str | None:
     """Converte query `role` (ex.: STUDENT) para rótulo [user_role] ou None."""
     if role is None:
@@ -85,6 +94,8 @@ class UserCreateBody(BaseModel):
     metadata: str | None = None
     create_firebase_user: bool = True
     temporary_password: str | None = None
+    neurotypical: bool | None = None
+    neurotypical_description: str | None = None
 
 
 class UserPatchBody(BaseModel):
@@ -130,6 +141,25 @@ async def _create_user_with_profile(
     )
     assert people_row is not None
     person_id = people_row["id"]
+
+    if _role_is_student(body.role) and (
+        body.neurotypical is not None or body.neurotypical_description is not None
+    ):
+        neuro_sets: list[str] = []
+        neuro_params: dict[str, Any] = {"pid": str(person_id)}
+        if body.neurotypical is not None:
+            neuro_sets.append("neurotypical = CAST(:neurotypical AS boolean)")
+            neuro_params["neurotypical"] = body.neurotypical
+        if body.neurotypical_description is not None:
+            neuro_sets.append("neurotypical_description = :neurotypical_description")
+            neuro_params["neurotypical_description"] = body.neurotypical_description
+        if neuro_sets:
+            await execute(
+                db,
+                f"UPDATE people SET {', '.join(neuro_sets)}, date_updated = now() "
+                "WHERE id = CAST(:pid AS uuid)",
+                neuro_params,
+            )
 
     firebase_uid = None
     if body.create_firebase_user:
