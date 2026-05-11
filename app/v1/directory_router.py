@@ -295,6 +295,8 @@ async def patch_user_v1(
         await execute(db, f"UPDATE profiles SET {', '.join(sets_profile)}, updated_at = now() WHERE id = CAST(:id AS uuid)", pr_params)
     await db.commit()
     out = await fetch_one(db, "SELECT * FROM vw_profiles WHERE id = CAST(:id AS uuid)", {"id": str(user_id)})
+    if not out:
+        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Falha ao recarregar usuário")
     return out
 
 
