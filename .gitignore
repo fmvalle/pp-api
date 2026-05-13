@@ -4,6 +4,7 @@
 secrets/*
 !secrets/.gitkeep
 venv/
+_pypkg/
 __pycache__/
 *.py[cod]
 .pytest_cache/

@@ -118,6 +118,12 @@ class Settings(BaseSettings):
         description="Tamanho máximo do upload (20 MiB por defeito).",
     )
 
+    answer_card_template_path: str | None = Field(
+        default=None,
+        description="Caminho absoluto ou relativo ao cwd para Cartao_Resposta-modelo.pdf. "
+        "Se vazio, usa app/v1/assets/Cartao_Resposta-modelo.pdf quando existir.",
+    )
+
     @model_validator(mode="after")
     def _validate_attendance_storage(self):
         if self.attendance_sheet_storage_backend == "gcs":

@@ -4,6 +4,7 @@ import logging
 import uuid
 from datetime import datetime
 from typing import Annotated, Any
+from urllib.parse import quote
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
@@ -25,6 +26,7 @@ from app.v1._scope import (
     is_staff_admin_role,
 )
 from app.v1._sql import execute, fetch_all, fetch_one
+from app.v1.answer_card_pdf import build_answer_card_pdf_bytes, resolve_answer_card_template_path
 from app.v1.attendance_sheet_pdf import build_attendance_sheet_pdf_bytes
 from app.v1.attendance_sheet_storage import load_attendance_sheet_bytes, store_attendance_sheet_bytes
 from app.core.config import settings
@@ -820,6 +822,76 @@ async def get_schedule_roster_v1(
         "attendance": attendance,
         **({"academic_year_id": str(ay)} if ay is not None else {}),
     }
+
+
+@router.get("/assessment-attendance/answer-card-pdf")
+async def download_answer_card_pdf_by_attendance_code(
+    ctx: Annotated[AuthContext, Depends(get_auth_context)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+    code: str = Query(..., min_length=1, description="assessment_attendance_list.code"),
+    academic_year_id: UUID | None = Query(
+        None,
+        description="Ano letivo do agendamento; se omitido, usa o da turma vinculada ao código.",
+    ),
+):
+    """PDF do cartão de resposta (modelo + QR e cabeçalho) para um código de presença."""
+    meta = await fetch_one(
+        db,
+        """
+        SELECT ass.id AS schedule_id, c.academic_year_id
+        FROM assessment_attendance_list aal
+        JOIN assessment_schedules ass ON ass.id = aal.assessment_schedules_id
+        JOIN classrooms c ON c.id = ass.classroom_id
+        WHERE lower(trim(aal.code::text)) = lower(trim(:code))
+        LIMIT 1
+        """,
+        {"code": code.strip()},
+    )
+    if not meta:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Código de presença não encontrado")
+    sid = UUID(str(meta["schedule_id"]))
+    ay = academic_year_id or UUID(str(meta["academic_year_id"]))
+    await get_schedule_v1(sid, ctx, db, academic_year_id=ay)
+
+    row = await fetch_one(
+        db,
+        """
+        SELECT ra, code, school, title, grade, classroom
+        FROM vw_student_assessment
+        WHERE lower(trim(code::text)) = lower(trim(:code))
+        LIMIT 1
+        """,
+        {"code": code.strip()},
+    )
+    if not row:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "View vw_student_assessment indisponível ou sem linha para este código. "
+            "Aplique a migração 006_vw_student_assessment.sql.",
+        )
+
+    tpl = resolve_answer_card_template_path(settings.answer_card_template_path)
+    if tpl is None:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "Modelo de cartão (PDF) não configurado. Defina ANSWER_CARD_TEMPLATE_PATH ou coloque "
+            "Cartao_Resposta-modelo.pdf em app/v1/assets/.",
+        )
+    try:
+        pdf = build_answer_card_pdf_bytes(template_path=tpl, row=dict(row))
+    except FileNotFoundError as e:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(e)) from e
+    except Exception as e:  # noqa: BLE001
+        log.exception("answer-card-pdf: falha ao montar PDF code=%s", code)
+        raise HTTPException(
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            "Falha ao gerar o PDF do cartão.",
+        ) from e
+
+    safe = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in code.strip())[:80] or "cartao"
+    filename = f"cartao-resposta-{safe}.pdf"
+    cd = f"attachment; filename=\"{filename}\"; filename*=UTF-8''{quote(filename)}"
+    return Response(content=pdf, media_type="application/pdf", headers={"Content-Disposition": cd})
 
 
 @router.patch("/assessment-schedules/{schedule_id}")
