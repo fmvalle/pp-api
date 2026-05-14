@@ -26,7 +26,11 @@ from app.v1._scope import (
     is_staff_admin_role,
 )
 from app.v1._sql import execute, fetch_all, fetch_one
-from app.v1.answer_card_pdf import build_answer_card_pdf_bytes, resolve_answer_card_template_path
+from app.v1.cartao_resposta_pdf import (
+    build_cartao_resposta_pdf_bytes_from_view_row,
+    merge_pdf_bytes,
+    suggested_download_filename,
+)
 from app.v1.attendance_sheet_pdf import build_attendance_sheet_pdf_bytes
 from app.v1.attendance_sheet_storage import load_attendance_sheet_bytes, store_attendance_sheet_bytes
 from app.core.config import settings
@@ -834,7 +838,7 @@ async def download_answer_card_pdf_by_attendance_code(
         description="Ano letivo do agendamento; se omitido, usa o da turma vinculada ao código.",
     ),
 ):
-    """PDF do cartão de resposta (modelo + QR e cabeçalho) para um código de presença."""
+    """PDF do cartão de resposta (ReportLab) para um `codigo_cartao` (presença na lista)."""
     meta = await fetch_one(
         db,
         """
@@ -856,9 +860,21 @@ async def download_answer_card_pdf_by_attendance_code(
     row = await fetch_one(
         db,
         """
-        SELECT ra, code, school, title, grade, classroom
+        SELECT
+          agendamento,
+          caderno,
+          ano_serie,
+          turma,
+          estudante,
+          ra_codigo,
+          codigo_cartao,
+          escola,
+          qr_code_text,
+          titulo,
+          logo_url,
+          output
         FROM vw_student_assessment
-        WHERE lower(trim(code::text)) = lower(trim(:code))
+        WHERE lower(trim(codigo_cartao::text)) = lower(trim(:code))
         LIMIT 1
         """,
         {"code": code.strip()},
@@ -866,21 +882,12 @@ async def download_answer_card_pdf_by_attendance_code(
     if not row:
         raise HTTPException(
             status.HTTP_503_SERVICE_UNAVAILABLE,
-            "View vw_student_assessment indisponível ou sem linha para este código. "
-            "Aplique a migração 006_vw_student_assessment.sql.",
-        )
-
-    tpl = resolve_answer_card_template_path(settings.answer_card_template_path)
-    if tpl is None:
-        raise HTTPException(
-            status.HTTP_503_SERVICE_UNAVAILABLE,
-            "Modelo de cartão (PDF) não configurado. Defina ANSWER_CARD_TEMPLATE_PATH ou coloque "
-            "Cartao_Resposta-modelo.pdf em app/v1/assets/.",
+            "View vw_student_assessment indisponível ou sem linha para este código, ou colunas "
+            "desatualizadas. Aplique a migração 006_vw_student_assessment.sql (campos: "
+            "codigo_cartao, qr_code_text, titulo, logo_url, output, …).",
         )
     try:
-        pdf = build_answer_card_pdf_bytes(template_path=tpl, row=dict(row))
-    except FileNotFoundError as e:
-        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(e)) from e
+        pdf = build_cartao_resposta_pdf_bytes_from_view_row(dict(row))
     except Exception as e:  # noqa: BLE001
         log.exception("answer-card-pdf: falha ao montar PDF code=%s", code)
         raise HTTPException(
@@ -888,8 +895,70 @@ async def download_answer_card_pdf_by_attendance_code(
             "Falha ao gerar o PDF do cartão.",
         ) from e
 
-    safe = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in code.strip())[:80] or "cartao"
-    filename = f"cartao-resposta-{safe}.pdf"
+    filename = suggested_download_filename(dict(row), fallback_code=code.strip())
+    cd = f"attachment; filename=\"{filename}\"; filename*=UTF-8''{quote(filename)}"
+    return Response(content=pdf, media_type="application/pdf", headers={"Content-Disposition": cd})
+
+
+@router.get("/assessment-schedules/{schedule_id}/answer-cards-combined-pdf")
+async def download_combined_answer_cards_pdf(
+    schedule_id: UUID,
+    ctx: Annotated[AuthContext, Depends(get_auth_context)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+    academic_year_id: UUID | None = Query(
+        None,
+        description="Ano letivo do agendamento (mesmo critério que GET do schedule).",
+    ),
+):
+    """Um único PDF com todas as folhas-resposta do agendamento (`vw_student_assessment.agendamento`)."""
+    await get_schedule_v1(schedule_id, ctx, db, academic_year_id=academic_year_id)
+    try:
+        rows = await fetch_all(
+            db,
+            """
+            SELECT
+              agendamento,
+              caderno,
+              ano_serie,
+              turma,
+              estudante,
+              ra_codigo,
+              codigo_cartao,
+              escola,
+              qr_code_text,
+              titulo,
+              logo_url,
+              output
+            FROM vw_student_assessment
+            WHERE agendamento = CAST(:sid AS uuid)
+            ORDER BY estudante NULLS LAST, codigo_cartao
+            """,
+            {"sid": str(schedule_id)},
+        )
+    except ProgrammingError as e:
+        log.exception("answer-cards-combined-pdf: view ou colunas inválidas schedule=%s", schedule_id)
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "View vw_student_assessment indisponível ou colunas desatualizadas.",
+        ) from e
+    if not rows:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            "Nenhum cartão-resposta para este agendamento (lista vazia na view ou todos com status out).",
+        )
+    parts: list[bytes] = []
+    try:
+        for r in rows:
+            parts.append(build_cartao_resposta_pdf_bytes_from_view_row(dict(r)))
+        pdf = merge_pdf_bytes(parts)
+    except Exception as e:  # noqa: BLE001
+        log.exception("answer-cards-combined-pdf: falha ao gerar schedule=%s", schedule_id)
+        raise HTTPException(
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            "Falha ao gerar o PDF combinado dos cartões.",
+        ) from e
+    base = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in str(schedule_id))[:36]
+    filename = f"cartoes-resposta-agendamento-{base}.pdf"
     cd = f"attachment; filename=\"{filename}\"; filename*=UTF-8''{quote(filename)}"
     return Response(content=pdf, media_type="application/pdf", headers={"Content-Disposition": cd})
 
