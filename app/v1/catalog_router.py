@@ -13,6 +13,7 @@ from app.db.session import get_db
 from app.v1._academic_year import resolve_academic_year_id
 from app.v1._paging import PageArgs, paged_response, paged_response_with_academic_year, pagination_params
 from app.v1._scope import (
+    get_descendant_school_ids,
     get_effective_classroom_scope,
     get_effective_school_scope,
     is_admin_like,
@@ -310,8 +311,12 @@ async def list_classrooms_v1(
                 eff_schools = sscope.get("effective_school_ids") or []
                 if str(school_id) not in {str(x) for x in eff_schools}:
                     raise HTTPException(status.HTTP_403_FORBIDDEN, "Escola fora do escopo")
-        sql += " AND school_id = CAST(:school_id AS uuid)"
-        params["school_id"] = str(school_id)
+        # Subárvore da escola pedida (nó + descendentes), consistente com o KPI do dashboard.
+        # Um admin escolar deve ver TODAS as turmas da sua escola e das escolas filhas;
+        # filtrar por school_id exato escondia turmas de unidades-filhas (lista vazia × contador > 0).
+        school_subtree = await get_descendant_school_ids(db, school_id)
+        sql += " AND school_id = ANY(CAST(:school_subtree AS uuid[]))"
+        params["school_subtree"] = [str(x) for x in school_subtree]
     if not cscope["is_admin_like"]:
         # Professor: turmas diretamente de `my_classrooms` (view base = `vw_teacher_classroom_options`)
         # + ano letivo já aplicado acima — não depender de `effective_classroom_ids` (pode divergir e zerar a lista).
