@@ -25,6 +25,7 @@ from app.v1.report_bundle import (
     assert_actor_can_read_classroom,
     assert_can_access_assessment_report_student,
     assert_can_read_schedule_report,
+    assessment_pedagogical_report_bundle,
     assessment_schedule_report_bundle,
     classroom_assessment_report_envelope,
     load_classroom_row_by_id,
@@ -744,6 +745,31 @@ async def report_classroom_v1(
         params,
     )
     return paged_response(page=pg.page, per_page=pg.per_page, total=(count_row or {}).get("total", 0), items=items)
+
+
+@router.get("/reports/assessments/{assessment_id}/pedagogical")
+async def report_assessment_pedagogical_v1(
+    assessment_id: UUID,
+    ctx: Annotated[AuthContext, Depends(get_auth_context)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+    classroom_id: UUID = Query(..., description="Turma do relatório (obrigatório)."),
+    student_id: UUID | None = Query(None, description="Aluno (omitido = consolidado da turma)."),
+    academic_year_id: UUID | None = Query(None, description="Ano letivo. Se omitido, usa is_primary=true."),
+):
+    """Relatório pedagógico por componente curricular (variação intervir/orientar/desafiar)."""
+    effective_ay = await resolve_academic_year_id(db, academic_year_id)
+    await assert_actor_can_read_classroom(db, ctx, classroom_id)
+    if student_id is not None:
+        await assert_can_access_assessment_report_student(
+            db, ctx, student_id=student_id, assessment_id=assessment_id
+        )
+    return await assessment_pedagogical_report_bundle(
+        db,
+        assessment_id=assessment_id,
+        classroom_id=classroom_id,
+        academic_year_id=effective_ay,
+        student_id=student_id,
+    )
 
 
 @router.get("/students/{student_id}/detail")

@@ -336,6 +336,383 @@ async def student_assessment_worksheet_bundle(
     }
 
 
+def _pedagogical_action(variation_pp: float) -> str:
+    """Classificação por variação em pontos percentuais (aluno - média de comparação).
+
+    < +5 p.p.  -> intervir
+    +5..+10    -> orientar
+    > +10      -> desafiar
+    """
+    if variation_pp > 10.0:
+        return "desafiar"
+    if variation_pp >= 5.0:
+        return "orientar"
+    return "intervir"
+
+
+_ACTION_LABEL = {
+    "intervir": "intervenção",
+    "orientar": "orientação",
+    "desafiar": "desafio",
+}
+
+
+def _build_pedagogical_reading(components: list[dict[str, Any]]) -> dict[str, Any]:
+    """Texto determinístico (sem IA) + componentes prioritários para intervenção."""
+    intervir = [c for c in components if c["pedagogicalAction"] == "intervir"]
+    orientar = [c for c in components if c["pedagogicalAction"] == "orientar"]
+    desafiar = [c for c in components if c["pedagogicalAction"] == "desafiar"]
+    intervir.sort(key=lambda c: c["variationPercentagePoints"])
+
+    parts: list[str] = []
+    if intervir:
+        nomes = ", ".join(c["componentName"] for c in intervir)
+        parts.append(f"Priorize intervenção em {nomes}")
+    if orientar:
+        nomes = ", ".join(c["componentName"] for c in orientar)
+        parts.append(f"oriente {nomes}")
+    if desafiar:
+        nomes = ", ".join(c["componentName"] for c in desafiar)
+        parts.append(f"desafie {nomes}")
+    text = ("; ".join(parts) + ".") if parts else "Sem dados suficientes para leitura pedagógica."
+    return {
+        "text": text,
+        "priorityComponents": [
+            {
+                "componentId": c["componentId"],
+                "componentName": c["componentName"],
+                "pedagogicalAction": c["pedagogicalAction"],
+                "variationPercentagePoints": c["variationPercentagePoints"],
+            }
+            for c in intervir
+        ],
+    }
+
+
+async def assessment_pedagogical_report_bundle(
+    db: AsyncSession,
+    *,
+    assessment_id: UUID,
+    classroom_id: UUID,
+    academic_year_id: UUID,
+    student_id: UUID | None,
+) -> dict[str, Any]:
+    """Relatório pedagógico por componente curricular (visão individual ou de turma)."""
+    head = await fetch_one(
+        db,
+        """
+        SELECT a.id AS assessment_id, a.title AS assessment_title, a.created_at AS assessment_date,
+               c.id AS classroom_id, c.name AS classroom_name,
+               s.name AS school_name, c.school_id
+        FROM classrooms c
+        JOIN assessments a ON a.id = CAST(:aid AS uuid)
+        LEFT JOIN schools s ON s.id = c.school_id
+        WHERE c.id = CAST(:cid AS uuid)
+          AND c.academic_year_id = CAST(:ay AS uuid)
+        """,
+        {"aid": str(assessment_id), "cid": str(classroom_id), "ay": str(academic_year_id)},
+    )
+    if not head:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            "Turma não encontrada para a avaliação/ano letivo informados",
+        )
+    school_id = head.get("school_id")
+    total_questions = await fetch_one(
+        db,
+        "SELECT COUNT(*)::int AS n FROM questions_assessments WHERE assessment_id = CAST(:aid AS uuid)",
+        {"aid": str(assessment_id)},
+    )
+    total_q = int((total_questions or {}).get("n") or 0)
+
+    student_block: dict[str, Any] | None = None
+    if student_id is not None:
+        prof = await fetch_one(
+            db,
+            "SELECT id, full_name, email FROM vw_profiles WHERE id = CAST(:id AS uuid)",
+            {"id": str(student_id)},
+        )
+        if not prof:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Aluno não encontrado")
+        student_block = {
+            "id": str(student_id),
+            "name": prof.get("full_name") or "",
+            "registrationCode": prof.get("registration_code") or prof.get("code"),
+        }
+
+    # --- Médias agregadas (acurácia média por aluno: turma/escola/sistema) ----
+    avg_row = await fetch_one(
+        db,
+        """
+        WITH per_student AS (
+            SELECT student_id, classroom_id,
+                   SUM(total_questions) AS tq, SUM(correct_answers) AS ca
+            FROM vw_assessment_component_results
+            WHERE assessment_id = CAST(:aid AS uuid)
+            GROUP BY student_id, classroom_id
+        ), acc AS (
+            SELECT ps.student_id, ps.classroom_id, c.school_id,
+                   CASE WHEN ps.tq > 0 THEN 100.0 * ps.ca / ps.tq ELSE 0 END AS accuracy
+            FROM per_student ps
+            JOIN classrooms c ON c.id = ps.classroom_id
+        )
+        SELECT
+            AVG(accuracy) FILTER (WHERE classroom_id = CAST(:cid AS uuid)) AS classroom_avg,
+            AVG(accuracy) FILTER (WHERE school_id = CAST(:sid AS uuid)) AS school_avg,
+            AVG(accuracy) AS system_avg
+        FROM acc
+        """,
+        {"aid": str(assessment_id), "cid": str(classroom_id), "sid": str(school_id)},
+    )
+    classroom_avg = float((avg_row or {}).get("classroom_avg") or 0.0)
+    school_avg = float((avg_row or {}).get("school_avg") or 0.0)
+    system_avg = float((avg_row or {}).get("system_avg") or 0.0)
+
+    # --- Componentes (acurácia por disciplina) --------------------------------
+    comp_rows = await fetch_all(
+        db,
+        """
+        WITH comp AS (
+            SELECT student_id, discipline_name, discipline_slug, area_slug,
+                   total_questions, correct_answers,
+                   CASE WHEN total_questions > 0
+                        THEN 100.0 * correct_answers / total_questions ELSE 0 END AS acc
+            FROM vw_assessment_component_results
+            WHERE assessment_id = CAST(:aid AS uuid)
+              AND classroom_id = CAST(:cid AS uuid)
+        )
+        SELECT discipline_name, discipline_slug, area_slug,
+               AVG(acc) AS classroom_acc,
+               SUM(total_questions) AS sum_tq,
+               SUM(correct_answers) AS sum_ca
+        FROM comp
+        GROUP BY discipline_name, discipline_slug, area_slug
+        ORDER BY discipline_name
+        """,
+        {"aid": str(assessment_id), "cid": str(classroom_id)},
+    )
+    student_comp: dict[str, dict[str, Any]] = {}
+    if student_id is not None:
+        srows = await fetch_all(
+            db,
+            """
+            SELECT discipline_name, discipline_slug, area_slug,
+                   total_questions, correct_answers,
+                   CASE WHEN total_questions > 0
+                        THEN 100.0 * correct_answers / total_questions ELSE 0 END AS acc
+            FROM vw_assessment_component_results
+            WHERE assessment_id = CAST(:aid AS uuid)
+              AND classroom_id = CAST(:cid AS uuid)
+              AND student_id = CAST(:sid AS uuid)
+            """,
+            {"aid": str(assessment_id), "cid": str(classroom_id), "sid": str(student_id)},
+        )
+        for r in srows:
+            student_comp[str(r.get("discipline_name") or "")] = r
+
+    areas = await fetch_all(db, "SELECT slug, name FROM curricular_areas", {})
+    area_name_by_slug = {str(a["slug"]): a.get("name") for a in areas}
+
+    def _area_name(slug: Any, fallback: str) -> str:
+        if slug and str(slug) in area_name_by_slug:
+            return str(area_name_by_slug[str(slug)])
+        return fallback
+
+    component_performance: list[dict[str, Any]] = []
+    student_total_q = 0
+    student_correct = 0
+    for r in comp_rows:
+        name = str(r.get("discipline_name") or "Sem componente")
+        comparison_avg = float(r.get("classroom_acc") or 0.0)
+        if student_id is not None:
+            sc = student_comp.get(name)
+            tq = int((sc or {}).get("total_questions") or 0)
+            ca = int((sc or {}).get("correct_answers") or 0)
+            student_accuracy = (100.0 * ca / tq) if tq else 0.0
+        else:
+            tq = int(r.get("sum_tq") or 0)
+            ca = int(r.get("sum_ca") or 0)
+            student_accuracy = comparison_avg
+        student_total_q += tq
+        student_correct += ca
+        variation = round(student_accuracy - comparison_avg, 1)
+        component_performance.append(
+            {
+                "componentId": str(r.get("discipline_slug") or name),
+                "componentName": name,
+                "areaName": _area_name(r.get("area_slug"), name),
+                "totalQuestions": tq,
+                "correctAnswers": ca,
+                "studentAccuracy": round(student_accuracy, 1),
+                "comparisonAverage": round(comparison_avg, 1),
+                "variationPercentagePoints": variation,
+                "pedagogicalAction": _pedagogical_action(variation),
+            }
+        )
+
+    if student_id is not None:
+        summary_total = student_total_q or total_q
+        summary_correct = student_correct
+        summary_accuracy = round((100.0 * summary_correct / summary_total), 1) if summary_total else 0.0
+    else:
+        summary_total = total_q
+        summary_correct = 0
+        summary_accuracy = round(classroom_avg, 1)
+
+    summary = {
+        "totalQuestions": summary_total,
+        "correctAnswers": summary_correct,
+        "accuracyPercentage": summary_accuracy,
+        "classroomAverage": round(classroom_avg, 1),
+        "schoolAverage": round(school_avg, 1),
+        "systemAverage": round(system_avg, 1),
+    }
+
+    pedagogical_reading = _build_pedagogical_reading(component_performance)
+
+    # --- Questão a questão -----------------------------------------------------
+    q_rows = await fetch_all(
+        db,
+        """
+        SELECT qa.question_id, qa.order_index,
+               qi.question_type, qi.discipline_name, qi.discipline_slug, qi.area_slug,
+               (SELECT label FROM question_alternative
+                 WHERE question_id = qi.id AND is_correct = true
+                 ORDER BY order_index NULLS LAST LIMIT 1) AS correct_answer
+        FROM questions_assessments qa
+        JOIN question_item qi ON qi.id = qa.question_id
+        WHERE qa.assessment_id = CAST(:aid AS uuid)
+        ORDER BY qa.order_index
+        """,
+        {"aid": str(assessment_id)},
+    )
+    skill_rows = await fetch_all(
+        db,
+        """
+        SELECT qit.question_id, qt.tag_type, qt.external_id AS code, qt.label AS description
+        FROM question_item_tag qit
+        JOIN question_tag qt ON qt.id = qit.tag_id
+        WHERE qt.tag_type IN ('skill', 'topic')
+        """,
+        {},
+    )
+    skill_by_q: dict[str, dict[str, Any]] = {}
+    for sr in skill_rows:
+        qid = str(sr.get("question_id") or "")
+        if not qid:
+            continue
+        # 'skill' tem prioridade sobre 'topic'
+        if qid not in skill_by_q or sr.get("tag_type") == "skill":
+            skill_by_q[qid] = {"code": sr.get("code"), "description": sr.get("description")}
+
+    stat_rows = await fetch_all(
+        db,
+        """
+        SELECT question_id,
+               SUM(responses) FILTER (WHERE school_id = CAST(:sid AS uuid)) AS school_resp,
+               SUM(correct)   FILTER (WHERE school_id = CAST(:sid AS uuid)) AS school_corr,
+               SUM(responses) AS sys_resp,
+               SUM(correct) AS sys_corr
+        FROM vw_question_item_stats
+        WHERE assessment_id = CAST(:aid AS uuid)
+        GROUP BY question_id
+        """,
+        {"aid": str(assessment_id), "sid": str(school_id)},
+    )
+    stat_by_q: dict[str, dict[str, Any]] = {str(r.get("question_id")): r for r in stat_rows}
+
+    answer_by_q: dict[str, dict[str, Any]] = {}
+    if student_id is not None:
+        ans_rows = await fetch_all(
+            db,
+            """
+            SELECT question_id, label, is_correct, correct_alternative
+            FROM vw_student_answers_report
+            WHERE student_id = CAST(:sid AS uuid)
+              AND assessment_id = CAST(:aid AS uuid)
+              AND classroom_id = CAST(:cid AS uuid)
+            """,
+            {"sid": str(student_id), "aid": str(assessment_id), "cid": str(classroom_id)},
+        )
+        answer_by_q = {str(r.get("question_id")): r for r in ans_rows}
+
+    def _pct(corr: Any, resp: Any) -> float | None:
+        c = int(corr or 0)
+        n = int(resp or 0)
+        return round(100.0 * c / n, 1) if n else None
+
+    groups: dict[str, dict[str, Any]] = {}
+    for q in q_rows:
+        qid = str(q.get("question_id") or "")
+        comp_name = str(q.get("discipline_name") or "Sem componente")
+        area_name = _area_name(q.get("area_slug"), comp_name)
+        skill = skill_by_q.get(qid) or {}
+        stat = stat_by_q.get(qid) or {}
+        ans = answer_by_q.get(qid)
+        student_answer = ans.get("label") if ans else None
+        is_correct = bool(ans.get("is_correct")) if ans else None
+        if is_correct is None:
+            status_label = "—"
+        else:
+            status_label = "Acertou" if is_correct else "Errou"
+        question = {
+            "questionNumber": int(q.get("order_index") or 0),
+            "questionType": q.get("question_type"),
+            "componentName": comp_name,
+            "skillCode": skill.get("code"),
+            "skillDescription": skill.get("description"),
+            "correctAnswer": q.get("correct_answer"),
+            "studentAnswer": student_answer,
+            "isCorrect": is_correct,
+            "statusLabel": status_label,
+            "schoolAccuracyPercentage": _pct(stat.get("school_corr"), stat.get("school_resp")),
+            "systemAccuracyPercentage": _pct(stat.get("sys_corr"), stat.get("sys_resp")),
+        }
+        g = groups.setdefault(
+            comp_name,
+            {"areaName": area_name, "componentName": comp_name, "questions": []},
+        )
+        g["questions"].append(question)
+
+    question_groups: list[dict[str, Any]] = []
+    for g in groups.values():
+        qs = g["questions"]
+        correct_in_group = sum(1 for q in qs if q["isCorrect"] is True)
+        answered = sum(1 for q in qs if q["isCorrect"] is not None)
+        g["totalQuestions"] = len(qs)
+        g["accuracyPercentage"] = round(100.0 * correct_in_group / answered, 1) if answered else None
+        question_groups.append(g)
+    question_groups.sort(key=lambda g: g["componentName"])
+
+    logger.info(
+        "[v1/reports/pedagogical] assessment_id=%s classroom_id=%s student_id=%s components=%s questions=%s",
+        assessment_id,
+        classroom_id,
+        student_id,
+        len(component_performance),
+        len(q_rows),
+    )
+
+    return {
+        "assessment": {
+            "id": str(assessment_id),
+            "title": head.get("assessment_title"),
+            "date": str(head.get("assessment_date")) if head.get("assessment_date") else None,
+            "totalQuestions": total_q,
+        },
+        "classroom": {
+            "id": str(classroom_id),
+            "name": head.get("classroom_name"),
+            "school": head.get("school_name"),
+        },
+        "student": student_block,
+        "summary": summary,
+        "componentPerformance": component_performance,
+        "pedagogicalReading": pedagogical_reading,
+        "questionGroups": question_groups,
+    }
+
+
 async def assert_can_read_schedule_report(
     db: AsyncSession,
     ctx: AuthContext,
