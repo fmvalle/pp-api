@@ -576,6 +576,7 @@ async def assessment_pedagogical_report_bundle(
         """
         SELECT qa.question_id, qa.order_index,
                qi.question_type, qi.discipline_name, qi.discipline_slug, qi.area_slug,
+               qi.description_html, qi.description_raw,
                (SELECT label FROM question_alternative
                  WHERE question_id = qi.id AND is_correct = true
                  ORDER BY order_index NULLS LAST LIMIT 1) AS correct_answer
@@ -621,6 +622,51 @@ async def assessment_pedagogical_report_bundle(
     )
     stat_by_q: dict[str, dict[str, Any]] = {str(r.get("question_id")): r for r in stat_rows}
 
+    # Alternativas de cada questão (enunciado, gabarito, texto).
+    alt_rows = await fetch_all(
+        db,
+        """
+        SELECT qa.question_id, alt.label, alt.text, alt.raw_text,
+               alt.is_correct, alt.order_index
+        FROM questions_assessments qa
+        JOIN question_alternative alt ON alt.question_id = qa.question_id
+        WHERE qa.assessment_id = CAST(:aid AS uuid)
+        ORDER BY qa.order_index, alt.order_index NULLS LAST
+        """,
+        {"aid": str(assessment_id)},
+    )
+    alts_by_q: dict[str, list[dict[str, Any]]] = {}
+    for ar in alt_rows:
+        qid = str(ar.get("question_id") or "")
+        if not qid:
+            continue
+        alts_by_q.setdefault(qid, []).append(ar)
+
+    # Contagem de seleção por alternativa, no escopo da turma.
+    sel_rows = await fetch_all(
+        db,
+        """
+        SELECT qsr.question_id, alt.label, COUNT(*)::int AS cnt
+        FROM question_student_responsed qsr
+        JOIN question_alternative alt ON alt.id = qsr.response_id
+        JOIN assessment_schedules ass ON ass.id = qsr.schedule_id
+        WHERE qsr.assessment_id = CAST(:aid AS uuid)
+          AND ass.classroom_id = CAST(:cid AS uuid)
+        GROUP BY qsr.question_id, alt.label
+        """,
+        {"aid": str(assessment_id), "cid": str(classroom_id)},
+    )
+    sel_by_q: dict[str, dict[str, int]] = {}
+    sel_total_by_q: dict[str, int] = {}
+    for sr in sel_rows:
+        qid = str(sr.get("question_id") or "")
+        if not qid:
+            continue
+        label = sr.get("label") or ""
+        cnt = int(sr.get("cnt") or 0)
+        sel_by_q.setdefault(qid, {})[label] = cnt
+        sel_total_by_q[qid] = sel_total_by_q.get(qid, 0) + cnt
+
     answer_by_q: dict[str, dict[str, Any]] = {}
     if student_id is not None:
         ans_rows = await fetch_all(
@@ -655,6 +701,22 @@ async def assessment_pedagogical_report_bundle(
             status_label = "—"
         else:
             status_label = "Acertou" if is_correct else "Errou"
+        sel_counts = sel_by_q.get(qid, {})
+        sel_total = sel_total_by_q.get(qid, 0)
+        alternatives = []
+        for alt in alts_by_q.get(qid, []):
+            label = alt.get("label") or ""
+            cnt = int(sel_counts.get(label, 0))
+            alternatives.append(
+                {
+                    "label": label,
+                    "text": alt.get("text") or alt.get("raw_text") or "",
+                    "isCorrect": bool(alt.get("is_correct")),
+                    "orderIndex": int(alt.get("order_index") or 0),
+                    "selectedCount": cnt,
+                    "selectedPercentage": round(100.0 * cnt / sel_total, 1) if sel_total else None,
+                }
+            )
         question = {
             "questionNumber": int(q.get("order_index") or 0),
             "questionType": q.get("question_type"),
@@ -667,6 +729,9 @@ async def assessment_pedagogical_report_bundle(
             "statusLabel": status_label,
             "schoolAccuracyPercentage": _pct(stat.get("school_corr"), stat.get("school_resp")),
             "systemAccuracyPercentage": _pct(stat.get("sys_corr"), stat.get("sys_resp")),
+            "description": q.get("description_html") or q.get("description_raw"),
+            "totalResponses": sel_total,
+            "alternatives": alternatives,
         }
         g = groups.setdefault(
             comp_name,
