@@ -402,6 +402,7 @@ async def assessment_pedagogical_report_bundle(
         db,
         """
         SELECT a.id AS assessment_id, a.title AS assessment_title, a.created_at AS assessment_date,
+               a.type AS assessment_type,
                c.id AS classroom_id, c.name AS classroom_name,
                s.name AS school_name, c.school_id
         FROM classrooms c
@@ -418,6 +419,9 @@ async def assessment_pedagogical_report_bundle(
             "Turma não encontrada para a avaliação/ano letivo informados",
         )
     school_id = head.get("school_id")
+    # Provas adaptativas só apresentam itens efetivamente respondidos (a base é
+    # maior do que o conjunto aplicado a cada aluno/turma).
+    is_adaptive = str(head.get("assessment_type") or "").lower() == "adaptive"
     total_questions = await fetch_one(
         db,
         "SELECT COUNT(*)::int AS n FROM questions_assessments WHERE assessment_id = CAST(:aid AS uuid)",
@@ -690,6 +694,15 @@ async def assessment_pedagogical_report_bundle(
     groups: dict[str, dict[str, Any]] = {}
     for q in q_rows:
         qid = str(q.get("question_id") or "")
+        # Adaptativa: oculta itens sem nenhuma resposta no escopo (aluno/turma).
+        if is_adaptive:
+            has_response = (
+                qid in answer_by_q
+                if student_id is not None
+                else sel_total_by_q.get(qid, 0) > 0
+            )
+            if not has_response:
+                continue
         comp_name = str(q.get("discipline_name") or "Sem componente")
         area_name = _area_name(q.get("area_slug"), comp_name)
         skill = skill_by_q.get(qid) or {}
