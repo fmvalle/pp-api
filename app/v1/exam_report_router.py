@@ -892,11 +892,15 @@ async def teacher_macro_assessments_v1(
 
     params: dict[str, Any] = {"ay": str(effective_ay)}
 
-    # Quando uma turma específica é informada, ela já determina o ano letivo.
-    # Filtrar também por academic_year_id pode zerar a listagem caso o ano
-    # selecionado no app (ex.: persistido em cache) divirja do ano da turma.
-    # Só restringimos por ano quando a listagem é ampla (sem turma).
-    ay_filter = "" if classroom_id else " AND c.academic_year_id = CAST(:ay AS uuid)"
+    # Filtro de ano letivo: aplicado só quando a listagem é ampla (sem turma)
+    # E não é o caso de um professor (cujo escopo já vem de `my_classrooms`).
+    # - turma informada → a própria turma determina o ano;
+    # - professor sem turma → escopo por `my_classrooms` (vê todas as suas turmas),
+    #   sem amarrar ao ano selecionado no app (que pode estar defasado em cache);
+    # - gestor sem turma → restringe ao ano letivo selecionado.
+    scope_by_teacher = (not cscope["is_admin_like"]) and is_teacher_like(ctx.role)
+    apply_ay = (classroom_id is None) and (not scope_by_teacher)
+    ay_filter = " AND c.academic_year_id = CAST(:ay AS uuid)" if apply_ay else ""
 
     def _scope_sql(alias: str) -> str:
         sql = ""
@@ -921,6 +925,7 @@ async def teacher_macro_assessments_v1(
     # Macro avaliações (consolidadas).
     macro_sql = f"""
     SELECT v.macro_assessment_id, v.classroom_id, v.school_id,
+           MIN(c.name) AS classroom_name,
            MIN(v.title) AS title,
            MIN(v.description) AS description,
            MIN(v.type) AS type,
@@ -941,6 +946,7 @@ async def teacher_macro_assessments_v1(
     # Cadernos avulsos (sem macro) — compatibilidade.
     legacy_sql = f"""
     SELECT vas.assessment_id, vas.classroom_id, vas.school_id,
+           c.name AS classroom_name,
            vas.title, vas.description, vas.type, vas.year, vas.is_active,
            COALESCE(vas.pending, 0)::int AS pending,
            COALESCE(vas.completed, 0)::int AS completed,
@@ -968,6 +974,7 @@ async def teacher_macro_assessments_v1(
                 "isActive": bool(r.get("is_active")),
                 "schoolId": str(r.get("school_id")) if r.get("school_id") else None,
                 "classroomId": str(r.get("classroom_id")) if r.get("classroom_id") else None,
+                "classroomName": r.get("classroom_name"),
                 "pending": int(r.get("pending") or 0),
                 "completed": int(r.get("completed") or 0),
                 "didNotDeliver": int(r.get("did_not_deliver") or 0),
@@ -986,12 +993,13 @@ async def teacher_macro_assessments_v1(
                 "isActive": bool(r.get("is_active")),
                 "schoolId": str(r.get("school_id")) if r.get("school_id") else None,
                 "classroomId": str(r.get("classroom_id")) if r.get("classroom_id") else None,
+                "classroomName": r.get("classroom_name"),
                 "pending": int(r.get("pending") or 0),
                 "completed": int(r.get("completed") or 0),
                 "didNotDeliver": int(r.get("did_not_deliver") or 0),
             }
         )
-    items.sort(key=lambda x: (x["title"] or "").lower())
+    items.sort(key=lambda x: ((x.get("classroomName") or "").lower(), (x["title"] or "").lower()))
     return {"items": items, "academic_year_id": str(effective_ay)}
 
 
