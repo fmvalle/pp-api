@@ -21,6 +21,12 @@ from app.v1._scope import (
 )
 from app.v1._sql import execute, fetch_all, fetch_one
 from app.v1.directory_router import _student_scope_read
+from app.v1.macro_report import (
+    macro_components_report,
+    macro_report_context,
+    macro_students_report,
+    resolve_macro_scope,
+)
 from app.v1.report_bundle import (
     assert_actor_can_read_classroom,
     assert_can_access_assessment_report_student,
@@ -834,6 +840,162 @@ async def teacher_classrooms_v1(
     rows = await fetch_all(db, sql, params)
     logger.info("[v1/teacher/classrooms] row_count=%s", len(rows))
     return rows
+
+
+async def _assert_teacher_classroom_scope(
+    db: AsyncSession,
+    ctx: AuthContext,
+    cscope: dict[str, Any],
+    classroom_id: UUID | None,
+) -> None:
+    """Garante que a turma filtrada pertence ao escopo do professor/gestor."""
+    if not classroom_id or cscope["is_admin_like"]:
+        return
+    if is_teacher_like(ctx.role):
+        ok = await fetch_one(
+            db,
+            """
+            SELECT 1 AS ok FROM my_classrooms mc
+            WHERE mc.teacher_id = CAST(:pid AS uuid)
+              AND mc.classroom_id = CAST(:cid AS uuid)
+            LIMIT 1
+            """,
+            {"pid": str(ctx.active_profile_id), "cid": str(classroom_id)},
+        )
+        if not ok:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "Turma fora do vínculo do professor")
+    elif str(classroom_id) not in {str(x) for x in (cscope["effective_classroom_ids"] or [])}:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Classroom fora do escopo")
+
+
+@router.get("/teacher/assessments")
+async def teacher_macro_assessments_v1(
+    ctx: Annotated[AuthContext, Depends(get_auth_context)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+    academic_year_id: UUID | None = Query(None, description="Ano letivo. Se omitido, usa is_primary=true."),
+    classroom_id: UUID | None = Query(None, description="Filtrar por turma selecionada."),
+):
+    """Listagem de **macro avaliações** do professor/gestor.
+
+    Fonte: ``vw_macro_assessment_summary``. Uma linha por (macro avaliação, turma),
+    consolidando pendentes/concluídos/não entregues de todos os cadernos.
+    """
+    effective_ay = await resolve_academic_year_id(db, academic_year_id)
+    cscope = await get_effective_classroom_scope(db, ctx)
+    await _assert_teacher_classroom_scope(db, ctx, cscope, classroom_id)
+
+    base = """
+    SELECT v.macro_assessment_id, v.classroom_id, v.school_id,
+           MIN(v.title) AS title,
+           MIN(v.description) AS description,
+           MIN(v.type) AS type,
+           MIN(v.year) AS year,
+           bool_or(v.is_active) AS is_active,
+           COALESCE(SUM(v.pending), 0)::int AS pending,
+           COALESCE(SUM(v.completed), 0)::int AS completed,
+           COALESCE(SUM(v.did_not_deliver), 0)::int AS did_not_deliver
+    FROM vw_macro_assessment_summary v
+    JOIN classrooms c ON c.id = v.classroom_id
+    WHERE c.academic_year_id = CAST(:ay AS uuid)
+    """
+    params: dict[str, Any] = {"ay": str(effective_ay)}
+    if classroom_id:
+        base += " AND v.classroom_id = CAST(:cid AS uuid)"
+        params["cid"] = str(classroom_id)
+    if not cscope["is_admin_like"]:
+        if is_teacher_like(ctx.role):
+            base += """
+              AND EXISTS (
+                SELECT 1 FROM my_classrooms mc
+                WHERE mc.teacher_id = CAST(:tid AS uuid)
+                  AND mc.classroom_id = v.classroom_id
+              )
+            """
+            params["tid"] = str(ctx.active_profile_id)
+        else:
+            base += " AND v.classroom_id = ANY(CAST(:cids AS uuid[]))"
+            params["cids"] = [str(x) for x in (cscope["effective_classroom_ids"] or [])]
+    base += """
+      GROUP BY v.macro_assessment_id, v.classroom_id, v.school_id
+      ORDER BY title NULLS LAST
+    """
+    rows = await fetch_all(db, base, params)
+    items = [
+        {
+            "macroAssessmentId": str(r.get("macro_assessment_id")) if r.get("macro_assessment_id") else None,
+            "title": r.get("title") or "",
+            "description": r.get("description"),
+            "type": r.get("type"),
+            "year": r.get("year"),
+            "isActive": bool(r.get("is_active")),
+            "schoolId": str(r.get("school_id")) if r.get("school_id") else None,
+            "classroomId": str(r.get("classroom_id")) if r.get("classroom_id") else None,
+            "pending": int(r.get("pending") or 0),
+            "completed": int(r.get("completed") or 0),
+            "didNotDeliver": int(r.get("did_not_deliver") or 0),
+        }
+        for r in rows
+    ]
+    return {"items": items, "academic_year_id": str(effective_ay)}
+
+
+@router.get("/teacher/macro-assessments/{macro_id}/report-context")
+async def macro_report_context_v1(
+    macro_id: UUID,
+    ctx: Annotated[AuthContext, Depends(get_auth_context)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+    classroom_id: UUID = Query(..., description="Turma do relatório (obrigatório)."),
+):
+    """Contexto da macro avaliação (macro + turma + cadernos).
+
+    Aceita também um `assessment_id` legado em ``macro_id`` (resolve a macro).
+    """
+    await assert_actor_can_read_classroom(db, ctx, classroom_id)
+    scope = await resolve_macro_scope(db, route_id=macro_id, classroom_id=classroom_id)
+    return await macro_report_context(db, scope=scope, classroom_id=classroom_id)
+
+
+@router.get("/teacher/macro-assessments/{macro_id}/assessments")
+async def macro_assessments_list_v1(
+    macro_id: UUID,
+    ctx: Annotated[AuthContext, Depends(get_auth_context)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+    classroom_id: UUID = Query(..., description="Turma do relatório (obrigatório)."),
+):
+    """Cadernos (`assessments`) de uma macro avaliação agendados para a turma."""
+    await assert_actor_can_read_classroom(db, ctx, classroom_id)
+    scope = await resolve_macro_scope(db, route_id=macro_id, classroom_id=classroom_id)
+    return {"macroAssessmentId": scope.get("macro_id"), "items": scope["assessments"]}
+
+
+@router.get("/teacher/macro-assessments/{macro_id}/report/components")
+async def macro_report_components_v1(
+    macro_id: UUID,
+    ctx: Annotated[AuthContext, Depends(get_auth_context)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+    classroom_id: UUID = Query(..., description="Turma do relatório (obrigatório)."),
+):
+    """Componentes consolidados de todos os cadernos da macro avaliação (turma)."""
+    await assert_actor_can_read_classroom(db, ctx, classroom_id)
+    scope = await resolve_macro_scope(db, route_id=macro_id, classroom_id=classroom_id)
+    return await macro_components_report(
+        db, assessment_ids=scope["assessment_ids"], classroom_id=classroom_id
+    )
+
+
+@router.get("/teacher/macro-assessments/{macro_id}/report/students")
+async def macro_report_students_v1(
+    macro_id: UUID,
+    ctx: Annotated[AuthContext, Depends(get_auth_context)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+    classroom_id: UUID = Query(..., description="Turma do relatório (obrigatório)."),
+):
+    """Desempenho por aluno consolidando a macro avaliação (linha por aluno×caderno)."""
+    await assert_actor_can_read_classroom(db, ctx, classroom_id)
+    scope = await resolve_macro_scope(db, route_id=macro_id, classroom_id=classroom_id)
+    return await macro_students_report(
+        db, assessment_ids=scope["assessment_ids"], classroom_id=classroom_id
+    )
 
 
 @router.get("/teacher/dashboard/summary")
