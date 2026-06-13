@@ -877,14 +877,49 @@ async def teacher_macro_assessments_v1(
 ):
     """Listagem de **macro avaliações** do professor/gestor.
 
-    Fonte: ``vw_macro_assessment_summary``. Uma linha por (macro avaliação, turma),
-    consolidando pendentes/concluídos/não entregues de todos os cadernos.
+    Fonte principal: ``vw_macro_assessment_summary`` (uma linha por macro avaliação
+    × turma, consolidando pendentes/concluídos/não entregues dos cadernos).
+
+    Para compatibilidade durante a transição, também inclui cadernos avulsos
+    (`assessments` sem ``macro_assessment_id``) a partir de ``vw_assessment_summary``,
+    para que avaliações ainda não vinculadas a uma macro não desapareçam da lista.
+    Cada item expõe ``id`` (macro avaliação **ou** assessment legado) — a rota de
+    relatório resolve ambos.
     """
     effective_ay = await resolve_academic_year_id(db, academic_year_id)
     cscope = await get_effective_classroom_scope(db, ctx)
     await _assert_teacher_classroom_scope(db, ctx, cscope, classroom_id)
 
-    base = """
+    params: dict[str, Any] = {"ay": str(effective_ay)}
+
+    # Quando uma turma específica é informada, ela já determina o ano letivo.
+    # Filtrar também por academic_year_id pode zerar a listagem caso o ano
+    # selecionado no app (ex.: persistido em cache) divirja do ano da turma.
+    # Só restringimos por ano quando a listagem é ampla (sem turma).
+    ay_filter = "" if classroom_id else " AND c.academic_year_id = CAST(:ay AS uuid)"
+
+    def _scope_sql(alias: str) -> str:
+        sql = ""
+        if classroom_id:
+            sql += f" AND {alias}.classroom_id = CAST(:cid AS uuid)"
+            params["cid"] = str(classroom_id)
+        if not cscope["is_admin_like"]:
+            if is_teacher_like(ctx.role):
+                sql += f"""
+                  AND EXISTS (
+                    SELECT 1 FROM my_classrooms mc
+                    WHERE mc.teacher_id = CAST(:tid AS uuid)
+                      AND mc.classroom_id = {alias}.classroom_id
+                  )
+                """
+                params["tid"] = str(ctx.active_profile_id)
+            else:
+                sql += f" AND {alias}.classroom_id = ANY(CAST(:cids AS uuid[]))"
+                params["cids"] = [str(x) for x in (cscope["effective_classroom_ids"] or [])]
+        return sql
+
+    # Macro avaliações (consolidadas).
+    macro_sql = f"""
     SELECT v.macro_assessment_id, v.classroom_id, v.school_id,
            MIN(v.title) AS title,
            MIN(v.description) AS description,
@@ -896,46 +931,67 @@ async def teacher_macro_assessments_v1(
            COALESCE(SUM(v.did_not_deliver), 0)::int AS did_not_deliver
     FROM vw_macro_assessment_summary v
     JOIN classrooms c ON c.id = v.classroom_id
-    WHERE c.academic_year_id = CAST(:ay AS uuid)
+    WHERE v.macro_assessment_id IS NOT NULL
+      {ay_filter}
+      {_scope_sql("v")}
+    GROUP BY v.macro_assessment_id, v.classroom_id, v.school_id
     """
-    params: dict[str, Any] = {"ay": str(effective_ay)}
-    if classroom_id:
-        base += " AND v.classroom_id = CAST(:cid AS uuid)"
-        params["cid"] = str(classroom_id)
-    if not cscope["is_admin_like"]:
-        if is_teacher_like(ctx.role):
-            base += """
-              AND EXISTS (
-                SELECT 1 FROM my_classrooms mc
-                WHERE mc.teacher_id = CAST(:tid AS uuid)
-                  AND mc.classroom_id = v.classroom_id
-              )
-            """
-            params["tid"] = str(ctx.active_profile_id)
-        else:
-            base += " AND v.classroom_id = ANY(CAST(:cids AS uuid[]))"
-            params["cids"] = [str(x) for x in (cscope["effective_classroom_ids"] or [])]
-    base += """
-      GROUP BY v.macro_assessment_id, v.classroom_id, v.school_id
-      ORDER BY title NULLS LAST
+    macro_rows = await fetch_all(db, macro_sql, params)
+
+    # Cadernos avulsos (sem macro) — compatibilidade.
+    legacy_sql = f"""
+    SELECT vas.assessment_id, vas.classroom_id, vas.school_id,
+           vas.title, vas.description, vas.type, vas.year, vas.is_active,
+           COALESCE(vas.pending, 0)::int AS pending,
+           COALESCE(vas.completed, 0)::int AS completed,
+           COALESCE(vas.did_not_deliver, 0)::int AS did_not_deliver
+    FROM vw_assessment_summary vas
+    JOIN classrooms c ON c.id = vas.classroom_id
+    JOIN assessments a ON a.id = vas.assessment_id
+    WHERE a.macro_assessment_id IS NULL
+      {ay_filter}
+      {_scope_sql("vas")}
     """
-    rows = await fetch_all(db, base, params)
-    items = [
-        {
-            "macroAssessmentId": str(r.get("macro_assessment_id")) if r.get("macro_assessment_id") else None,
-            "title": r.get("title") or "",
-            "description": r.get("description"),
-            "type": r.get("type"),
-            "year": r.get("year"),
-            "isActive": bool(r.get("is_active")),
-            "schoolId": str(r.get("school_id")) if r.get("school_id") else None,
-            "classroomId": str(r.get("classroom_id")) if r.get("classroom_id") else None,
-            "pending": int(r.get("pending") or 0),
-            "completed": int(r.get("completed") or 0),
-            "didNotDeliver": int(r.get("did_not_deliver") or 0),
-        }
-        for r in rows
-    ]
+    legacy_rows = await fetch_all(db, legacy_sql, params)
+
+    items: list[dict[str, Any]] = []
+    for r in macro_rows:
+        items.append(
+            {
+                "id": str(r.get("macro_assessment_id")),
+                "macroAssessmentId": str(r.get("macro_assessment_id")),
+                "isMacro": True,
+                "title": r.get("title") or "",
+                "description": r.get("description"),
+                "type": r.get("type"),
+                "year": r.get("year"),
+                "isActive": bool(r.get("is_active")),
+                "schoolId": str(r.get("school_id")) if r.get("school_id") else None,
+                "classroomId": str(r.get("classroom_id")) if r.get("classroom_id") else None,
+                "pending": int(r.get("pending") or 0),
+                "completed": int(r.get("completed") or 0),
+                "didNotDeliver": int(r.get("did_not_deliver") or 0),
+            }
+        )
+    for r in legacy_rows:
+        items.append(
+            {
+                "id": str(r.get("assessment_id")),
+                "macroAssessmentId": None,
+                "isMacro": False,
+                "title": r.get("title") or "",
+                "description": r.get("description"),
+                "type": r.get("type"),
+                "year": r.get("year"),
+                "isActive": bool(r.get("is_active")),
+                "schoolId": str(r.get("school_id")) if r.get("school_id") else None,
+                "classroomId": str(r.get("classroom_id")) if r.get("classroom_id") else None,
+                "pending": int(r.get("pending") or 0),
+                "completed": int(r.get("completed") or 0),
+                "didNotDeliver": int(r.get("did_not_deliver") or 0),
+            }
+        )
+    items.sort(key=lambda x: (x["title"] or "").lower())
     return {"items": items, "academic_year_id": str(effective_ay)}
 
 

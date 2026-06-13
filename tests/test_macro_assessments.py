@@ -130,20 +130,75 @@ async def test_teacher_macro_assessments_listing_shapes_items(monkeypatch):
     async def fake_scope(_db, _ctx):
         return {"is_admin_like": False, "effective_classroom_ids": []}
 
-    async def fake_fetch_all(_db, _sql, _params=None):
+    async def fake_fetch_all(_db, sql, _params=None):
+        if "vw_macro_assessment_summary" in sql:
+            return [
+                {
+                    "macro_assessment_id": str(macro_id),
+                    "classroom_id": str(cid),
+                    "school_id": str(uuid.uuid4()),
+                    "title": "Avaliação Bimestral",
+                    "description": "desc",
+                    "type": "exam",
+                    "year": 2026,
+                    "is_active": True,
+                    "pending": 10,
+                    "completed": 20,
+                    "did_not_deliver": 2,
+                }
+            ]
+        return []  # sem cadernos avulsos
+
+    monkeypatch.setattr(exam_report_router, "resolve_academic_year_id", fake_resolve)
+    monkeypatch.setattr(exam_report_router, "get_effective_classroom_scope", fake_scope)
+    monkeypatch.setattr(exam_report_router, "fetch_all", fake_fetch_all)
+
+    out = await exam_report_router.teacher_macro_assessments_v1(
+        ctx=_ctx("teacher"),
+        db=object(),  # type: ignore[arg-type]
+        academic_year_id=None,
+        classroom_id=None,
+    )
+    assert len(out["items"]) == 1
+    item = out["items"][0]
+    assert item["id"] == str(macro_id)
+    assert item["macroAssessmentId"] == str(macro_id)
+    assert item["isMacro"] is True
+    assert item["pending"] == 10
+    assert item["completed"] == 20
+    assert item["didNotDeliver"] == 2
+    assert item["isActive"] is True
+
+
+@pytest.mark.asyncio
+async def test_teacher_macro_assessments_includes_legacy_standalone(monkeypatch):
+    ay = uuid.uuid4()
+    aid = uuid.uuid4()
+    cid = uuid.uuid4()
+
+    async def fake_resolve(_db, _q):
+        return ay
+
+    async def fake_scope(_db, _ctx):
+        return {"is_admin_like": False, "effective_classroom_ids": []}
+
+    async def fake_fetch_all(_db, sql, _params=None):
+        if "vw_macro_assessment_summary" in sql:
+            return []  # nenhuma macro vinculada ainda
+        # caderno avulso (sem macro)
         return [
             {
-                "macro_assessment_id": str(macro_id),
+                "assessment_id": str(aid),
                 "classroom_id": str(cid),
                 "school_id": str(uuid.uuid4()),
-                "title": "Avaliação Bimestral",
-                "description": "desc",
+                "title": "Prova Avulsa",
+                "description": None,
                 "type": "exam",
                 "year": 2026,
                 "is_active": True,
-                "pending": 10,
-                "completed": 20,
-                "did_not_deliver": 2,
+                "pending": 3,
+                "completed": 5,
+                "did_not_deliver": 1,
             }
         ]
 
@@ -159,11 +214,9 @@ async def test_teacher_macro_assessments_listing_shapes_items(monkeypatch):
     )
     assert len(out["items"]) == 1
     item = out["items"][0]
-    assert item["macroAssessmentId"] == str(macro_id)
-    assert item["pending"] == 10
-    assert item["completed"] == 20
-    assert item["didNotDeliver"] == 2
-    assert item["isActive"] is True
+    assert item["id"] == str(aid)
+    assert item["isMacro"] is False
+    assert item["macroAssessmentId"] is None
 
 
 @pytest.mark.asyncio
