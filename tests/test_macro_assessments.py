@@ -226,7 +226,7 @@ async def test_macro_students_report_includes_assessment_title(monkeypatch):
 
     async def fake_fetch_all(_db, sql, _params=None):
         # Listagem parte das matrículas (classroom_students × cadernos agendados).
-        if "FROM assessment_schedules" in sql:
+        if "FROM assessment_attendance_list" in sql:
             return [
                 {
                     "student_id": sid,
@@ -274,7 +274,7 @@ async def test_macro_students_report_includes_pending_students(monkeypatch):
     sid = str(uuid.uuid4())
 
     async def fake_fetch_all(_db, sql, _params=None):
-        if "FROM assessment_schedules" in sql:
+        if "FROM assessment_attendance_list" in sql:
             return [
                 {
                     "student_id": sid,
@@ -444,7 +444,7 @@ async def test_macro_students_report_for_classrooms_includes_classroom(monkeypat
     sid = str(uuid.uuid4())
 
     async def fake_fetch_all(_db, sql, _params=None):
-        if "FROM assessment_schedules" in sql:
+        if "FROM assessment_attendance_list" in sql:
             return [
                 {
                     "student_id": sid,

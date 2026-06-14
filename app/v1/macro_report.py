@@ -346,39 +346,38 @@ async def _students_for_classrooms(
     assessment_ids: list[str],
     classroom_ids: list[str],
 ) -> list[dict[str, Any]]:
-    """Lista de desempenho por (aluno × caderno × turma) a partir das MATRÍCULAS.
+    """Lista de desempenho por (aluno × caderno × turma) a partir da PRESENÇA.
 
-    A listagem parte de ``classroom_students`` cruzado com os cadernos agendados
-    para a turma (``assessment_schedules``), de modo que todos os alunos aparecem
-    mesmo sem respostas (status ``pending``, acertos zero). Acertos/itens
-    respondidos vêm de ``vw_assessment_component_results``; o total de itens é a
-    base do caderno (``questions_assessments``).
+    A listagem parte de ``assessment_attendance_list`` (vínculo real do aluno ao
+    caderno/agendamento), de modo que cada aluno aparece apenas nos cadernos a que
+    está vinculado — sem duplicar quando a turma tem vários cadernos — e mesmo sem
+    respostas (status ``pending``, acertos zero). Acertos/itens respondidos vêm de
+    ``vw_assessment_component_results``; o total de itens é a base do caderno
+    (``questions_assessments``).
     """
     rows = await fetch_all(
         db,
         """
-        SELECT DISTINCT ON (cs.student_id, a.id, cs.classroom_id)
-               cs.student_id,
+        SELECT al.student_id,
                COALESCE(p.full_name, '') AS full_name,
-               cs.classroom_id,
+               sch.classroom_id,
                cl.name AS classroom_name,
-               a.id AS assessment_id,
+               sch.assessment_id,
                a.title AS assessment_title,
                ar.status,
                ar.score,
                ar.submitted_at
-        FROM assessment_schedules sch
-        JOIN classroom_students cs ON cs.classroom_id = sch.classroom_id
-        JOIN classrooms cl ON cl.id = cs.classroom_id
+        FROM assessment_attendance_list al
+        JOIN assessment_schedules sch ON sch.id = al.assessment_schedules_id
+        JOIN classrooms cl ON cl.id = sch.classroom_id
         JOIN assessments a ON a.id = sch.assessment_id
         LEFT JOIN assessment_results ar
-               ON ar.student_id = cs.student_id
-              AND ar.assessment_id = a.id
-              AND ar.classroom_id = cs.classroom_id
-        LEFT JOIN vw_profiles p ON p.id = cs.student_id
+               ON ar.student_id = al.student_id
+              AND ar.assessment_id = sch.assessment_id
+              AND ar.classroom_id = sch.classroom_id
+        LEFT JOIN vw_profiles p ON p.id = al.student_id
         WHERE sch.assessment_id = ANY(CAST(:aids AS uuid[]))
-          AND cs.classroom_id = ANY(CAST(:cids AS uuid[]))
-        ORDER BY cs.student_id, a.id, cs.classroom_id
+          AND sch.classroom_id = ANY(CAST(:cids AS uuid[]))
         """,
         {"aids": assessment_ids, "cids": classroom_ids},
     )
