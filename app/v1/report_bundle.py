@@ -755,12 +755,17 @@ async def assessment_pedagogical_report_bundle(
     question_groups: list[dict[str, Any]] = []
     for g in groups.values():
         qs = g["questions"]
+        qs.sort(key=lambda q: q["questionNumber"])
         correct_in_group = sum(1 for q in qs if q["isCorrect"] is True)
         answered = sum(1 for q in qs if q["isCorrect"] is not None)
         g["totalQuestions"] = len(qs)
         g["accuracyPercentage"] = round(100.0 * correct_in_group / answered, 1) if answered else None
         question_groups.append(g)
-    question_groups.sort(key=lambda g: g["componentName"])
+    # Ordena os componentes pela ordem das questões (menor número de questão do
+    # grupo), de modo que a sequência siga a numeração das questões.
+    question_groups.sort(
+        key=lambda g: g["questions"][0]["questionNumber"] if g["questions"] else 0
+    )
 
     logger.info(
         "[v1/reports/pedagogical] assessment_id=%s classroom_id=%s student_id=%s components=%s questions=%s",
