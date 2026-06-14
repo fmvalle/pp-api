@@ -225,20 +225,31 @@ async def test_macro_students_report_includes_assessment_title(monkeypatch):
     sid = str(uuid.uuid4())
 
     async def fake_fetch_all(_db, sql, _params=None):
-        if "FROM assessment_results" in sql:
+        # Listagem parte das matrículas (classroom_students × cadernos agendados).
+        if "FROM assessment_schedules" in sql:
             return [
                 {
                     "student_id": sid,
                     "full_name": "Aluno Teste",
                     "assessment_id": "a1",
                     "assessment_title": "Caderno 1",
+                    "classroom_id": str(cid),
+                    "classroom_name": "5º Ano A",
                     "status": "submitted",
                     "score": 8.0,
                     "submitted_at": None,
                 }
             ]
         if "vw_assessment_component_results" in sql:
-            return [{"student_id": sid, "assessment_id": "a1", "tq": 10, "ca": 8}]
+            return [
+                {
+                    "student_id": sid,
+                    "assessment_id": "a1",
+                    "classroom_id": str(cid),
+                    "tq": 10,
+                    "ca": 8,
+                }
+            ]
         if "FROM questions_assessments" in sql:
             return [{"assessment_id": "a1", "n": 12}]
         return []
@@ -254,6 +265,89 @@ async def test_macro_students_report_includes_assessment_title(monkeypatch):
     assert row["correctAnswers"] == 8
     assert row["totalQuestions"] == 12  # base de itens
     assert row["accuracyPercentage"] == pytest.approx(66.7, abs=0.1)
+
+
+@pytest.mark.asyncio
+async def test_macro_students_report_includes_pending_students(monkeypatch):
+    """Alunos matriculados aparecem mesmo sem resposta (status pending, zerado)."""
+    cid = uuid.uuid4()
+    sid = str(uuid.uuid4())
+
+    async def fake_fetch_all(_db, sql, _params=None):
+        if "FROM assessment_schedules" in sql:
+            return [
+                {
+                    "student_id": sid,
+                    "full_name": "Aluno Sem Resposta",
+                    "assessment_id": "a1",
+                    "assessment_title": "Caderno 1",
+                    "classroom_id": str(cid),
+                    "classroom_name": "5º Ano A",
+                    "status": None,  # sem assessment_results → pending
+                    "score": None,
+                    "submitted_at": None,
+                }
+            ]
+        if "vw_assessment_component_results" in sql:
+            return []  # sem respostas
+        if "FROM questions_assessments" in sql:
+            return [{"assessment_id": "a1", "n": 12}]
+        return []
+
+    monkeypatch.setattr(macro_report, "fetch_all", fake_fetch_all)
+
+    out = await macro_report.macro_students_report(
+        object(), assessment_ids=["a1"], classroom_id=cid  # type: ignore[arg-type]
+    )
+    assert len(out["items"]) == 1
+    row = out["items"][0]
+    assert row["status"] == "pending"
+    assert row["correctAnswers"] == 0
+    assert row["totalQuestions"] == 12  # base de itens, mesmo sem resposta
+    assert row["accuracyPercentage"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_component_performance_from_question_base(monkeypatch):
+    """Componentes derivam da base de questões dos cadernos, mesmo sem respostas."""
+    cid = str(uuid.uuid4())
+
+    async def fake_fetch_all(_db, sql, _params=None):
+        if "FROM questions_assessments qa" in sql:
+            return [
+                {
+                    "discipline_name": "Matemática",
+                    "discipline_slug": "matematica",
+                    "area_slug": "matematica",
+                    "base_questions": 15,
+                },
+                {
+                    "discipline_name": "Português",
+                    "discipline_slug": "portugues",
+                    "area_slug": "linguagens",
+                    "base_questions": 10,
+                },
+            ]
+        if "vw_assessment_component_results" in sql:
+            return []  # nenhuma resposta ainda
+        if "curricular_areas" in sql:
+            return [
+                {"slug": "matematica", "name": "Matemática e suas Tecnologias"},
+                {"slug": "linguagens", "name": "Linguagens, Códigos e suas Tecnologias"},
+            ]
+        return []
+
+    monkeypatch.setattr(macro_report, "fetch_all", fake_fetch_all)
+
+    out = await macro_report._component_performance(
+        object(), assessment_ids=["a1"], classroom_ids=[cid]  # type: ignore[arg-type]
+    )
+    assert len(out) == 2
+    mat = next(c for c in out if c["componentName"] == "Matemática")
+    assert mat["totalQuestions"] == 15  # base de itens
+    assert mat["correctAnswers"] == 0
+    assert mat["studentAccuracy"] == 0.0
+    assert mat["areaName"] == "Matemática e suas Tecnologias"
 
 
 # ---------------------------------------------------------------------------
@@ -350,7 +444,7 @@ async def test_macro_students_report_for_classrooms_includes_classroom(monkeypat
     sid = str(uuid.uuid4())
 
     async def fake_fetch_all(_db, sql, _params=None):
-        if "FROM assessment_results" in sql:
+        if "FROM assessment_schedules" in sql:
             return [
                 {
                     "student_id": sid,

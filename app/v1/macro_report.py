@@ -255,56 +255,56 @@ async def resolve_macro_scope_school(
     }
 
 
-async def macro_components_report_for_classrooms(
+async def _component_performance(
     db: AsyncSession,
     *,
     assessment_ids: list[str],
     classroom_ids: list[str],
-) -> dict[str, Any]:
-    """Componentes consolidados da macro avaliação para um conjunto de turmas.
+) -> list[dict[str, Any]]:
+    """Lista de componentes a partir da BASE de questões dos cadernos.
 
-    Versão multi-turma (escola): soma itens/acertos das turmas em ``classroom_ids``;
-    médias usam acurácia por aluno. ``systemAverage`` considera todas as turmas que
-    responderam aos cadernos (base do sistema).
+    A lista de componentes (e o número de questões por componente) deriva das
+    questões vinculadas aos cadernos (`questions_assessments` → `question_item`),
+    de modo que os componentes aparecem mesmo sem respostas dos alunos. Acertos e
+    acurácia vêm das respostas (`vw_assessment_component_results`) quando existem;
+    caso contrário ficam zerados.
     """
-    avg_row = await fetch_one(
+    base_rows = await fetch_all(
         db,
         """
-        WITH per_student AS (
-            SELECT student_id, classroom_id,
-                   SUM(total_questions) AS tq, SUM(correct_answers) AS ca
-            FROM vw_assessment_component_results
-            WHERE assessment_id = ANY(CAST(:aids AS uuid[]))
-            GROUP BY student_id, classroom_id
-        ), acc AS (
-            SELECT student_id, classroom_id,
-                   CASE WHEN tq > 0 THEN 100.0 * ca / tq ELSE 0 END AS accuracy
-            FROM per_student
-        )
-        SELECT
-            AVG(accuracy) FILTER (WHERE classroom_id = ANY(CAST(:cids AS uuid[]))) AS school_avg,
-            AVG(accuracy) AS system_avg
-        FROM acc
+        SELECT COALESCE(qi.discipline_name, 'Sem componente') AS discipline_name,
+               qi.discipline_slug, qi.area_slug,
+               COUNT(*)::int AS base_questions
+        FROM questions_assessments qa
+        JOIN question_item qi ON qi.id = qa.question_id
+        WHERE qa.assessment_id = ANY(CAST(:aids AS uuid[]))
+        GROUP BY qi.discipline_name, qi.discipline_slug, qi.area_slug
+        ORDER BY discipline_name
         """,
-        {"aids": assessment_ids, "cids": classroom_ids},
+        {"aids": assessment_ids},
     )
-    school_avg = float((avg_row or {}).get("school_avg") or 0.0)
-    system_avg = float((avg_row or {}).get("system_avg") or 0.0)
 
-    comp_rows = await fetch_all(
+    resp_rows = await fetch_all(
         db,
         """
-        SELECT discipline_name, discipline_slug, area_slug,
-               SUM(total_questions) AS sum_tq,
-               SUM(correct_answers) AS sum_ca
+        SELECT COALESCE(discipline_name, 'Sem componente') AS discipline_name,
+               discipline_slug, area_slug,
+               SUM(total_questions) AS tq,
+               SUM(correct_answers) AS ca
         FROM vw_assessment_component_results
         WHERE assessment_id = ANY(CAST(:aids AS uuid[]))
           AND classroom_id = ANY(CAST(:cids AS uuid[]))
         GROUP BY discipline_name, discipline_slug, area_slug
-        ORDER BY discipline_name
         """,
         {"aids": assessment_ids, "cids": classroom_ids},
     )
+
+    def _key(dn: Any, ds: Any, ar: Any) -> tuple[str, str, str]:
+        return (str(ds or ""), str(dn or ""), str(ar or ""))
+
+    resp_by: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for r in resp_rows:
+        resp_by[_key(r.get("discipline_name"), r.get("discipline_slug"), r.get("area_slug"))] = r
 
     areas = await fetch_all(db, "SELECT slug, name FROM curricular_areas", {})
     area_name_by_slug = {str(a["slug"]): a.get("name") for a in areas}
@@ -314,84 +314,71 @@ async def macro_components_report_for_classrooms(
             return str(area_name_by_slug[str(slug)])
         return fallback
 
-    component_performance: list[dict[str, Any]] = []
-    for r in comp_rows:
-        name = str(r.get("discipline_name") or "Sem componente")
-        tq = int(r.get("sum_tq") or 0)
-        ca = int(r.get("sum_ca") or 0)
-        accuracy = round((100.0 * ca / tq), 1) if tq else 0.0
+    out: list[dict[str, Any]] = []
+    for b in base_rows:
+        name = str(b.get("discipline_name") or "Sem componente")
+        base_q = int(b.get("base_questions") or 0)
+        rr = resp_by.get(_key(b.get("discipline_name"), b.get("discipline_slug"), b.get("area_slug"))) or {}
+        tq_resp = int(rr.get("tq") or 0)
+        ca_resp = int(rr.get("ca") or 0)
+        total_q = tq_resp if tq_resp > 0 else base_q
+        accuracy = round(100.0 * ca_resp / tq_resp, 1) if tq_resp > 0 else 0.0
         variation = 0.0
-        component_performance.append(
+        out.append(
             {
-                "componentId": str(r.get("discipline_slug") or name),
+                "componentId": str(b.get("discipline_slug") or name),
                 "componentName": name,
-                "areaName": _area_name(r.get("area_slug"), name),
-                "totalQuestions": tq,
-                "correctAnswers": ca,
+                "areaName": _area_name(b.get("area_slug"), name),
+                "totalQuestions": total_q,
+                "correctAnswers": ca_resp,
                 "studentAccuracy": accuracy,
                 "comparisonAverage": accuracy,
                 "variationPercentagePoints": variation,
                 "pedagogicalAction": _pedagogical_action(variation),
             }
         )
-
-    total_row = await fetch_one(
-        db,
-        """
-        SELECT COUNT(*)::int AS n
-        FROM questions_assessments
-        WHERE assessment_id = ANY(CAST(:aids AS uuid[]))
-        """,
-        {"aids": assessment_ids},
-    )
-    total_q = int((total_row or {}).get("n") or 0)
-
-    summary = {
-        "totalQuestions": total_q,
-        "correctAnswers": 0,
-        "accuracyPercentage": round(school_avg, 1),
-        "classroomAverage": round(school_avg, 1),
-        "schoolAverage": round(school_avg, 1),
-        "systemAverage": round(system_avg, 1),
-    }
-
-    return {
-        "summary": summary,
-        "componentPerformance": component_performance,
-        "pedagogicalReading": _build_pedagogical_reading(component_performance),
-    }
+    return out
 
 
-async def macro_students_report_for_classrooms(
+async def _students_for_classrooms(
     db: AsyncSession,
     *,
     assessment_ids: list[str],
     classroom_ids: list[str],
-) -> dict[str, Any]:
-    """Desempenho por aluno consolidando a macro para um conjunto de turmas.
+) -> list[dict[str, Any]]:
+    """Lista de desempenho por (aluno × caderno × turma) a partir das MATRÍCULAS.
 
-    Uma linha por (aluno, caderno) em qualquer turma de ``classroom_ids``; inclui
-    ``classroomName`` para identificar a turma de cada linha.
+    A listagem parte de ``classroom_students`` cruzado com os cadernos agendados
+    para a turma (``assessment_schedules``), de modo que todos os alunos aparecem
+    mesmo sem respostas (status ``pending``, acertos zero). Acertos/itens
+    respondidos vêm de ``vw_assessment_component_results``; o total de itens é a
+    base do caderno (``questions_assessments``).
     """
     rows = await fetch_all(
         db,
         """
-        SELECT ar.student_id,
+        SELECT DISTINCT ON (cs.student_id, a.id, cs.classroom_id)
+               cs.student_id,
                COALESCE(p.full_name, '') AS full_name,
-               ar.assessment_id,
-               a.title AS assessment_title,
-               ar.classroom_id,
+               cs.classroom_id,
                cl.name AS classroom_name,
+               a.id AS assessment_id,
+               a.title AS assessment_title,
                ar.status,
                ar.score,
                ar.submitted_at
-        FROM assessment_results ar
-        JOIN assessments a ON a.id = ar.assessment_id
-        LEFT JOIN classrooms cl ON cl.id = ar.classroom_id
-        LEFT JOIN vw_profiles p ON p.id = ar.student_id
-        WHERE ar.classroom_id = ANY(CAST(:cids AS uuid[]))
-          AND ar.assessment_id = ANY(CAST(:aids AS uuid[]))
-        ORDER BY cl.name NULLS LAST, p.full_name NULLS LAST, a.title
+        FROM assessment_schedules sch
+        JOIN classroom_students cs ON cs.classroom_id = sch.classroom_id
+        JOIN classrooms cl ON cl.id = cs.classroom_id
+        JOIN assessments a ON a.id = sch.assessment_id
+        LEFT JOIN assessment_results ar
+               ON ar.student_id = cs.student_id
+              AND ar.assessment_id = a.id
+              AND ar.classroom_id = cs.classroom_id
+        LEFT JOIN vw_profiles p ON p.id = cs.student_id
+        WHERE sch.assessment_id = ANY(CAST(:aids AS uuid[]))
+          AND cs.classroom_id = ANY(CAST(:cids AS uuid[]))
+        ORDER BY cs.student_id, a.id, cs.classroom_id
         """,
         {"aids": assessment_ids, "cids": classroom_ids},
     )
@@ -443,7 +430,7 @@ async def macro_students_report_for_classrooms(
                 "assessmentTitle": r.get("assessment_title") or "",
                 "classroomId": cid,
                 "classroomName": r.get("classroom_name") or "",
-                "status": r.get("status"),
+                "status": r.get("status") or "pending",
                 "score": float(r["score"]) if r.get("score") is not None else None,
                 "correctAnswers": correct,
                 "totalQuestions": total,
@@ -452,6 +439,98 @@ async def macro_students_report_for_classrooms(
             }
         )
 
+    items.sort(
+        key=lambda x: (
+            (x["classroomName"] or "").lower(),
+            (x["studentName"] or "").lower(),
+            (x["assessmentTitle"] or "").lower(),
+        )
+    )
+    return items
+
+
+async def macro_components_report_for_classrooms(
+    db: AsyncSession,
+    *,
+    assessment_ids: list[str],
+    classroom_ids: list[str],
+) -> dict[str, Any]:
+    """Componentes consolidados da macro avaliação para um conjunto de turmas.
+
+    Versão multi-turma (escola): a lista de componentes vem da base de questões
+    dos cadernos; médias usam acurácia por aluno. ``systemAverage`` considera
+    todas as turmas que responderam aos cadernos (base do sistema).
+    """
+    avg_row = await fetch_one(
+        db,
+        """
+        WITH per_student AS (
+            SELECT student_id, classroom_id,
+                   SUM(total_questions) AS tq, SUM(correct_answers) AS ca
+            FROM vw_assessment_component_results
+            WHERE assessment_id = ANY(CAST(:aids AS uuid[]))
+            GROUP BY student_id, classroom_id
+        ), acc AS (
+            SELECT student_id, classroom_id,
+                   CASE WHEN tq > 0 THEN 100.0 * ca / tq ELSE 0 END AS accuracy
+            FROM per_student
+        )
+        SELECT
+            AVG(accuracy) FILTER (WHERE classroom_id = ANY(CAST(:cids AS uuid[]))) AS school_avg,
+            AVG(accuracy) AS system_avg
+        FROM acc
+        """,
+        {"aids": assessment_ids, "cids": classroom_ids},
+    )
+    school_avg = float((avg_row or {}).get("school_avg") or 0.0)
+    system_avg = float((avg_row or {}).get("system_avg") or 0.0)
+
+    component_performance = await _component_performance(
+        db, assessment_ids=assessment_ids, classroom_ids=classroom_ids
+    )
+
+    total_row = await fetch_one(
+        db,
+        """
+        SELECT COUNT(*)::int AS n
+        FROM questions_assessments
+        WHERE assessment_id = ANY(CAST(:aids AS uuid[]))
+        """,
+        {"aids": assessment_ids},
+    )
+    total_q = int((total_row or {}).get("n") or 0)
+
+    summary = {
+        "totalQuestions": total_q,
+        "correctAnswers": 0,
+        "accuracyPercentage": round(school_avg, 1),
+        "classroomAverage": round(school_avg, 1),
+        "schoolAverage": round(school_avg, 1),
+        "systemAverage": round(system_avg, 1),
+    }
+
+    return {
+        "summary": summary,
+        "componentPerformance": component_performance,
+        "pedagogicalReading": _build_pedagogical_reading(component_performance),
+    }
+
+
+async def macro_students_report_for_classrooms(
+    db: AsyncSession,
+    *,
+    assessment_ids: list[str],
+    classroom_ids: list[str],
+) -> dict[str, Any]:
+    """Desempenho por aluno consolidando a macro para um conjunto de turmas.
+
+    Uma linha por (aluno, caderno) em qualquer turma de ``classroom_ids`` — inclui
+    todos os alunos matriculados, mesmo pendentes; ``classroomName`` identifica a
+    turma de cada linha.
+    """
+    items = await _students_for_classrooms(
+        db, assessment_ids=assessment_ids, classroom_ids=classroom_ids
+    )
     return {"items": items}
 
 
@@ -535,51 +614,11 @@ async def macro_components_report(
     school_avg = float((avg_row or {}).get("school_avg") or 0.0)
     system_avg = float((avg_row or {}).get("system_avg") or 0.0)
 
-    comp_rows = await fetch_all(
-        db,
-        """
-        SELECT discipline_name, discipline_slug, area_slug,
-               SUM(total_questions) AS sum_tq,
-               SUM(correct_answers) AS sum_ca
-        FROM vw_assessment_component_results
-        WHERE assessment_id = ANY(CAST(:aids AS uuid[]))
-          AND classroom_id = CAST(:cid AS uuid)
-        GROUP BY discipline_name, discipline_slug, area_slug
-        ORDER BY discipline_name
-        """,
-        {"aids": assessment_ids, "cid": str(classroom_id)},
+    # Lista de componentes a partir da base de questões dos cadernos (aparecem
+    # mesmo sem respostas); acertos vêm das respostas da turma.
+    component_performance = await _component_performance(
+        db, assessment_ids=assessment_ids, classroom_ids=[str(classroom_id)]
     )
-
-    areas = await fetch_all(db, "SELECT slug, name FROM curricular_areas", {})
-    area_name_by_slug = {str(a["slug"]): a.get("name") for a in areas}
-
-    def _area_name(slug: Any, fallback: str) -> str:
-        if slug and str(slug) in area_name_by_slug:
-            return str(area_name_by_slug[str(slug)])
-        return fallback
-
-    component_performance: list[dict[str, Any]] = []
-    for r in comp_rows:
-        name = str(r.get("discipline_name") or "Sem componente")
-        tq = int(r.get("sum_tq") or 0)
-        ca = int(r.get("sum_ca") or 0)
-        accuracy = round((100.0 * ca / tq), 1) if tq else 0.0
-        # Visão de turma: acurácia consolidada vs. ela mesma (variação 0),
-        # mantendo a semântica do relatório por turma já existente.
-        variation = 0.0
-        component_performance.append(
-            {
-                "componentId": str(r.get("discipline_slug") or name),
-                "componentName": name,
-                "areaName": _area_name(r.get("area_slug"), name),
-                "totalQuestions": tq,
-                "correctAnswers": ca,
-                "studentAccuracy": accuracy,
-                "comparisonAverage": accuracy,
-                "variationPercentagePoints": variation,
-                "pedagogicalAction": _pedagogical_action(variation),
-            }
-        )
 
     # Total de itens da base (todos os cadernos).
     total_row = await fetch_one(
@@ -618,81 +657,10 @@ async def macro_students_report(
     """Desempenho por aluno consolidando a macro avaliação.
 
     Uma linha por (aluno, caderno), com `assessmentTitle`, status, acertos, total
-    de itens, percentual e data de envio.
+    de itens, percentual e data de envio. Inclui todos os alunos matriculados na
+    turma, mesmo pendentes (status ``pending``, acertos zero).
     """
-    rows = await fetch_all(
-        db,
-        """
-        SELECT ar.student_id,
-               COALESCE(p.full_name, '') AS full_name,
-               ar.assessment_id,
-               a.title AS assessment_title,
-               ar.status,
-               ar.score,
-               ar.submitted_at
-        FROM assessment_results ar
-        JOIN assessments a ON a.id = ar.assessment_id
-        LEFT JOIN vw_profiles p ON p.id = ar.student_id
-        WHERE ar.classroom_id = CAST(:cid AS uuid)
-          AND ar.assessment_id = ANY(CAST(:aids AS uuid[]))
-        ORDER BY p.full_name NULLS LAST, a.title
-        """,
-        {"aids": assessment_ids, "cid": str(classroom_id)},
+    items = await _students_for_classrooms(
+        db, assessment_ids=assessment_ids, classroom_ids=[str(classroom_id)]
     )
-
-    # Acertos/itens respondidos por (aluno, caderno).
-    correct_rows = await fetch_all(
-        db,
-        """
-        SELECT student_id, assessment_id,
-               SUM(total_questions) AS tq, SUM(correct_answers) AS ca
-        FROM vw_assessment_component_results
-        WHERE assessment_id = ANY(CAST(:aids AS uuid[]))
-          AND classroom_id = CAST(:cid AS uuid)
-        GROUP BY student_id, assessment_id
-        """,
-        {"aids": assessment_ids, "cid": str(classroom_id)},
-    )
-    correct_by: dict[tuple[str, str], dict[str, Any]] = {}
-    for r in correct_rows:
-        key = (str(r.get("student_id")), str(r.get("assessment_id")))
-        correct_by[key] = r
-
-    # Total de itens da base por caderno (para mostrar total mesmo sem resposta).
-    base_rows = await fetch_all(
-        db,
-        """
-        SELECT assessment_id, COUNT(*)::int AS n
-        FROM questions_assessments
-        WHERE assessment_id = ANY(CAST(:aids AS uuid[]))
-        GROUP BY assessment_id
-        """,
-        {"aids": assessment_ids},
-    )
-    base_by = {str(r.get("assessment_id")): int(r.get("n") or 0) for r in base_rows}
-
-    items: list[dict[str, Any]] = []
-    for r in rows:
-        sid = str(r.get("student_id"))
-        aid = str(r.get("assessment_id"))
-        agg = correct_by.get((sid, aid)) or {}
-        correct = int(agg.get("ca") or 0)
-        answered = int(agg.get("tq") or 0)
-        total = base_by.get(aid) or answered
-        accuracy = round((100.0 * correct / total), 1) if total else None
-        items.append(
-            {
-                "studentId": sid,
-                "studentName": r.get("full_name") or "",
-                "assessmentId": aid,
-                "assessmentTitle": r.get("assessment_title") or "",
-                "status": r.get("status"),
-                "score": float(r["score"]) if r.get("score") is not None else None,
-                "correctAnswers": correct,
-                "totalQuestions": total,
-                "accuracyPercentage": accuracy,
-                "submittedAt": str(r["submitted_at"]) if r.get("submitted_at") else None,
-            }
-        )
-
     return {"items": items}
