@@ -344,10 +344,39 @@ async def test_component_performance_from_question_base(monkeypatch):
     )
     assert len(out) == 2
     mat = next(c for c in out if c["componentName"] == "Matemática")
-    assert mat["totalQuestions"] == 15  # base de itens
+    assert mat["totalQuestions"] == 15  # 1 caderno → base de itens
     assert mat["correctAnswers"] == 0
     assert mat["studentAccuracy"] == 0.0
     assert mat["areaName"] == "Matemática e suas Tecnologias"
+
+
+@pytest.mark.asyncio
+async def test_component_questions_divided_by_cadernos(monkeypatch):
+    """Coluna Questões = questões do componente em UM caderno (base / nº cadernos)."""
+
+    async def fake_fetch_all(_db, sql, _params=None):
+        if "FROM questions_assessments qa" in sql:
+            # 50 questões somando 2 cadernos → 25 por caderno.
+            return [
+                {
+                    "discipline_name": "Matemática",
+                    "discipline_slug": "matematica",
+                    "area_slug": "matematica",
+                    "base_questions": 50,
+                }
+            ]
+        if "vw_assessment_component_results" in sql:
+            return []
+        if "curricular_areas" in sql:
+            return [{"slug": "matematica", "name": "Matemática e suas Tecnologias"}]
+        return []
+
+    monkeypatch.setattr(macro_report, "fetch_all", fake_fetch_all)
+
+    out = await macro_report._component_performance(
+        object(), assessment_ids=["a1", "a2"], classroom_ids=["c1"]  # type: ignore[arg-type]
+    )
+    assert out[0]["totalQuestions"] == 25
 
 
 # ---------------------------------------------------------------------------

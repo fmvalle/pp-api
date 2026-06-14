@@ -314,14 +314,18 @@ async def _component_performance(
             return str(area_name_by_slug[str(slug)])
         return fallback
 
+    # Quantidade de questões do componente em UM caderno. Como a base soma todos
+    # os cadernos e a distribuição é igual entre eles, divide-se pelo nº de cadernos.
+    num_cadernos = max(1, len(assessment_ids))
+
     out: list[dict[str, Any]] = []
     for b in base_rows:
         name = str(b.get("discipline_name") or "Sem componente")
         base_q = int(b.get("base_questions") or 0)
+        per_caderno = round(base_q / num_cadernos)
         rr = resp_by.get(_key(b.get("discipline_name"), b.get("discipline_slug"), b.get("area_slug"))) or {}
         tq_resp = int(rr.get("tq") or 0)
         ca_resp = int(rr.get("ca") or 0)
-        total_q = tq_resp if tq_resp > 0 else base_q
         accuracy = round(100.0 * ca_resp / tq_resp, 1) if tq_resp > 0 else 0.0
         variation = 0.0
         out.append(
@@ -329,7 +333,7 @@ async def _component_performance(
                 "componentId": str(b.get("discipline_slug") or name),
                 "componentName": name,
                 "areaName": _area_name(b.get("area_slug"), name),
-                "totalQuestions": total_q,
+                "totalQuestions": per_caderno,
                 "correctAnswers": ca_resp,
                 "studentAccuracy": accuracy,
                 "comparisonAverage": accuracy,
