@@ -508,6 +508,90 @@ async def exam_assessment_result_v1(
     return row
 
 
+class GradeResultBody(BaseModel):
+    student_id: UUID
+    assessment_id: UUID
+    status: str | None = Field(
+        default=None,
+        description="pending | in_progress | submitted | graded. "
+        "Se omitido, é derivado da quantidade de questões respondidas.",
+    )
+
+
+_ALLOWED_RESULT_STATUS = {"pending", "in_progress", "submitted", "graded"}
+
+
+@router.post("/reports/assessment-results/grade")
+async def grade_assessment_result_v1(
+    body: GradeResultBody,
+    ctx: Annotated[AuthContext, Depends(get_auth_context)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+):
+    """Gera/atualiza o resultado de um aluno em uma avaliação.
+
+    Calcula o score (percentual de acertos) a partir das respostas e faz upsert
+    em assessment_results via a function `fn_grade_assessment_result`.
+    """
+    if not (is_admin_like(ctx.role) or is_teacher_like(ctx.role)):
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN, "Apenas professor ou gestor"
+        )
+    if body.status is not None and body.status not in _ALLOWED_RESULT_STATUS:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "status deve ser um de: " + ", ".join(sorted(_ALLOWED_RESULT_STATUS)),
+        )
+    row = await fetch_one(
+        db,
+        """
+        SELECT * FROM public.fn_grade_assessment_result(
+            CAST(:sid AS uuid), CAST(:aid AS uuid), :st
+        )
+        """,
+        {
+            "sid": str(body.student_id),
+            "aid": str(body.assessment_id),
+            "st": body.status,
+        },
+    )
+    await db.commit()
+    return row
+
+
+@router.post("/reports/assessments/{assessment_id}/grade-all")
+async def grade_assessment_all_v1(
+    assessment_id: UUID,
+    ctx: Annotated[AuthContext, Depends(get_auth_context)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+    status_param: str | None = Query(
+        None,
+        alias="status",
+        description="pending | in_progress | submitted | graded (opcional).",
+    ),
+):
+    """Gera/atualiza os resultados de todos os alunos vinculados ao caderno."""
+    if not (is_admin_like(ctx.role) or is_teacher_like(ctx.role)):
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN, "Apenas professor ou gestor"
+        )
+    if status_param is not None and status_param not in _ALLOWED_RESULT_STATUS:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "status deve ser um de: " + ", ".join(sorted(_ALLOWED_RESULT_STATUS)),
+        )
+    rows = await fetch_all(
+        db,
+        """
+        SELECT * FROM public.fn_grade_assessment_all(
+            CAST(:aid AS uuid), :st
+        )
+        """,
+        {"aid": str(assessment_id), "st": status_param},
+    )
+    await db.commit()
+    return {"graded": len(rows), "items": rows}
+
+
 @router.get("/exam/evaluation-in-progress")
 async def exam_eval_in_progress_v1(
     ctx: Annotated[AuthContext, Depends(get_auth_context)],
