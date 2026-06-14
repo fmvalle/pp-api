@@ -13,6 +13,7 @@ from app.db.session import get_db
 from app.v1._academic_year import resolve_academic_year_id
 from app.v1._paging import PageArgs, paged_response, paged_response_with_academic_year, pagination_params
 from app.v1._scope import (
+    get_descendant_school_ids,
     get_effective_classroom_scope,
     get_effective_school_scope,
     is_admin_like,
@@ -23,9 +24,12 @@ from app.v1._sql import execute, fetch_all, fetch_one
 from app.v1.directory_router import _student_scope_read
 from app.v1.macro_report import (
     macro_components_report,
+    macro_components_report_for_classrooms,
     macro_report_context,
     macro_students_report,
+    macro_students_report_for_classrooms,
     resolve_macro_scope,
+    resolve_macro_scope_school,
 )
 from app.v1.report_bundle import (
     assert_actor_can_read_classroom,
@@ -1059,6 +1063,232 @@ async def macro_report_students_v1(
     scope = await resolve_macro_scope(db, route_id=macro_id, classroom_id=classroom_id)
     return await macro_students_report(
         db, assessment_ids=scope["assessment_ids"], classroom_id=classroom_id
+    )
+
+
+# ---------------------------------------------------------------------------
+# Visão do gestor escolar: macro avaliações consolidadas por ESCOLA.
+# ---------------------------------------------------------------------------
+
+
+async def _resolve_school_ids(
+    db: AsyncSession, ctx: AuthContext, school_id: UUID
+) -> list[UUID]:
+    """Valida o escopo do gestor e devolve a subárvore de escolas permitida.
+
+    Reutiliza :func:`resolve_admin_dashboard_school_ids` (403 se não for staff
+    admin; intersecta com o escopo do `school_admin`).
+    """
+    ids = await resolve_admin_dashboard_school_ids(db, ctx, school_id)
+    if ids is None:
+        # admin global sem recorte explícito: restringe à subárvore pedida.
+        ids = await get_descendant_school_ids(db, school_id)
+    if not ids:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Escola fora do seu escopo")
+    return ids
+
+
+@router.get("/school-admin/schools/{school_id}/macro-assessments")
+async def school_admin_macro_assessments_v1(
+    school_id: UUID,
+    ctx: Annotated[AuthContext, Depends(get_auth_context)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+    academic_year_id: UUID | None = Query(None, description="Ano letivo. Se omitido, usa is_primary=true."),
+):
+    """Lista **macro avaliações** consolidadas por escola (1 linha por macro).
+
+    Soma pendentes/concluídos/não entregues de todas as turmas da escola e conta
+    quantas turmas têm cadernos da macro. Inclui cadernos avulsos (sem macro).
+    """
+    effective_ay = await resolve_academic_year_id(db, academic_year_id)
+    school_ids = await _resolve_school_ids(db, ctx, school_id)
+    params: dict[str, Any] = {"ay": str(effective_ay), "sids": [str(s) for s in school_ids]}
+
+    macro_sql = """
+    SELECT v.macro_assessment_id,
+           MIN(c.school_id::text) AS school_id,
+           MIN(v.title) AS title,
+           MIN(v.description) AS description,
+           MIN(v.type) AS type,
+           MIN(v.year) AS year,
+           bool_or(v.is_active) AS is_active,
+           COUNT(DISTINCT v.classroom_id) AS classrooms,
+           COALESCE(SUM(v.pending), 0)::int AS pending,
+           COALESCE(SUM(v.completed), 0)::int AS completed,
+           COALESCE(SUM(v.did_not_deliver), 0)::int AS did_not_deliver
+    FROM vw_macro_assessment_summary v
+    JOIN classrooms c ON c.id = v.classroom_id
+    WHERE v.macro_assessment_id IS NOT NULL
+      AND c.school_id = ANY(CAST(:sids AS uuid[]))
+      AND c.academic_year_id = CAST(:ay AS uuid)
+    GROUP BY v.macro_assessment_id
+    """
+    macro_rows = await fetch_all(db, macro_sql, params)
+
+    legacy_sql = """
+    SELECT vas.assessment_id,
+           MIN(c.school_id::text) AS school_id,
+           MIN(vas.title) AS title,
+           MIN(vas.description) AS description,
+           MIN(vas.type) AS type,
+           MIN(vas.year) AS year,
+           bool_or(vas.is_active) AS is_active,
+           COUNT(DISTINCT vas.classroom_id) AS classrooms,
+           COALESCE(SUM(vas.pending), 0)::int AS pending,
+           COALESCE(SUM(vas.completed), 0)::int AS completed,
+           COALESCE(SUM(vas.did_not_deliver), 0)::int AS did_not_deliver
+    FROM vw_assessment_summary vas
+    JOIN classrooms c ON c.id = vas.classroom_id
+    JOIN assessments a ON a.id = vas.assessment_id
+    WHERE a.macro_assessment_id IS NULL
+      AND c.school_id = ANY(CAST(:sids AS uuid[]))
+      AND c.academic_year_id = CAST(:ay AS uuid)
+    GROUP BY vas.assessment_id
+    """
+    legacy_rows = await fetch_all(db, legacy_sql, params)
+
+    items: list[dict[str, Any]] = []
+    for r in macro_rows:
+        items.append(
+            {
+                "id": str(r.get("macro_assessment_id")),
+                "macroAssessmentId": str(r.get("macro_assessment_id")),
+                "isMacro": True,
+                "title": r.get("title") or "",
+                "description": r.get("description"),
+                "type": r.get("type"),
+                "year": r.get("year"),
+                "isActive": bool(r.get("is_active")),
+                "schoolId": r.get("school_id"),
+                "classrooms": int(r.get("classrooms") or 0),
+                "pending": int(r.get("pending") or 0),
+                "completed": int(r.get("completed") or 0),
+                "didNotDeliver": int(r.get("did_not_deliver") or 0),
+            }
+        )
+    for r in legacy_rows:
+        items.append(
+            {
+                "id": str(r.get("assessment_id")),
+                "macroAssessmentId": None,
+                "isMacro": False,
+                "title": r.get("title") or "",
+                "description": r.get("description"),
+                "type": r.get("type"),
+                "year": r.get("year"),
+                "isActive": bool(r.get("is_active")),
+                "schoolId": r.get("school_id"),
+                "classrooms": int(r.get("classrooms") or 0),
+                "pending": int(r.get("pending") or 0),
+                "completed": int(r.get("completed") or 0),
+                "didNotDeliver": int(r.get("did_not_deliver") or 0),
+            }
+        )
+    items.sort(key=lambda x: (x["title"] or "").lower())
+    return {"items": items, "academic_year_id": str(effective_ay)}
+
+
+@router.get("/school-admin/macro-assessments/{macro_id}/assessments")
+async def school_admin_macro_cadernos_v1(
+    macro_id: UUID,
+    ctx: Annotated[AuthContext, Depends(get_auth_context)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+    school_id: UUID = Query(..., description="Escola do gestor (obrigatório)."),
+):
+    """Lista TODOS os cadernos (`assessments`) de uma macro avaliação (para agendar).
+
+    Não exige agendamento prévio; aceita também um `assessment_id` legado.
+    """
+    await _resolve_school_ids(db, ctx, school_id)
+    macro_row = await fetch_one(
+        db,
+        "SELECT id, title FROM macro_assessments WHERE id = CAST(:id AS uuid)",
+        {"id": str(macro_id)},
+    )
+    if macro_row:
+        rows = await fetch_all(
+            db,
+            """
+            SELECT id, title, description, type
+            FROM assessments
+            WHERE macro_assessment_id = CAST(:mid AS uuid)
+            ORDER BY created_at, title
+            """,
+            {"mid": str(macro_id)},
+        )
+    else:
+        rows = await fetch_all(
+            db,
+            "SELECT id, title, description, type FROM assessments WHERE id = CAST(:id AS uuid)",
+            {"id": str(macro_id)},
+        )
+        if not rows:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Macro avaliação não encontrada")
+    items = [
+        {
+            "id": str(r["id"]),
+            "title": r.get("title") or "",
+            "description": r.get("description"),
+            "type": r.get("type"),
+        }
+        for r in rows
+    ]
+    return {"macroAssessmentId": str(macro_id) if macro_row else None, "items": items}
+
+
+@router.get("/school-admin/macro-assessments/{macro_id}/report/context")
+async def school_admin_macro_report_context_v1(
+    macro_id: UUID,
+    ctx: Annotated[AuthContext, Depends(get_auth_context)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+    school_id: UUID = Query(..., description="Escola do gestor (obrigatório)."),
+):
+    """Contexto consolidado por escola: macro + cadernos + turmas (para o seletor)."""
+    school_ids = await _resolve_school_ids(db, ctx, school_id)
+    scope = await resolve_macro_scope_school(db, route_id=macro_id, school_ids=school_ids)
+    school_row = await fetch_one(
+        db,
+        "SELECT id, name FROM schools WHERE id = CAST(:id AS uuid)",
+        {"id": str(school_id)},
+    )
+    return {
+        "macroAssessment": {"id": scope.get("macro_id"), "title": scope.get("macro_title") or ""},
+        "school": {
+            "id": str(school_id),
+            "name": (school_row or {}).get("name") or "",
+        },
+        "assessments": scope["assessments"],
+        "classrooms": scope["classrooms"],
+    }
+
+
+@router.get("/school-admin/macro-assessments/{macro_id}/report/components")
+async def school_admin_macro_report_components_v1(
+    macro_id: UUID,
+    ctx: Annotated[AuthContext, Depends(get_auth_context)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+    school_id: UUID = Query(..., description="Escola do gestor (obrigatório)."),
+):
+    """Componentes consolidados de todos os cadernos da macro em toda a escola."""
+    school_ids = await _resolve_school_ids(db, ctx, school_id)
+    scope = await resolve_macro_scope_school(db, route_id=macro_id, school_ids=school_ids)
+    return await macro_components_report_for_classrooms(
+        db, assessment_ids=scope["assessment_ids"], classroom_ids=scope["classroom_ids"]
+    )
+
+
+@router.get("/school-admin/macro-assessments/{macro_id}/report/students")
+async def school_admin_macro_report_students_v1(
+    macro_id: UUID,
+    ctx: Annotated[AuthContext, Depends(get_auth_context)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+    school_id: UUID = Query(..., description="Escola do gestor (obrigatório)."),
+):
+    """Desempenho por aluno consolidando a macro em toda a escola (linha por aluno×caderno×turma)."""
+    school_ids = await _resolve_school_ids(db, ctx, school_id)
+    scope = await resolve_macro_scope_school(db, route_id=macro_id, school_ids=school_ids)
+    return await macro_students_report_for_classrooms(
+        db, assessment_ids=scope["assessment_ids"], classroom_ids=scope["classroom_ids"]
     )
 
 

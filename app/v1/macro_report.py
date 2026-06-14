@@ -133,6 +133,328 @@ async def resolve_macro_scope(
     }
 
 
+async def resolve_macro_scope_school(
+    db: AsyncSession,
+    *,
+    route_id: UUID,
+    school_ids: list[UUID],
+) -> dict[str, Any]:
+    """Resolve o contexto de macro avaliação no escopo de uma ESCOLA (subárvore).
+
+    Diferente de :func:`resolve_macro_scope` (que recorta por uma turma), aqui os
+    cadernos e turmas consideradas são todos os agendados em QUALQUER turma das
+    escolas em ``school_ids``. Retorna também a lista de turmas para o seletor.
+    """
+    macro_row = await fetch_one(
+        db,
+        "SELECT id, title FROM macro_assessments WHERE id = CAST(:id AS uuid)",
+        {"id": str(route_id)},
+    )
+
+    macro_id: str | None = None
+    macro_title = ""
+    is_macro = False
+
+    if macro_row:
+        macro_id = str(macro_row.get("id"))
+        macro_title = macro_row.get("title") or ""
+        is_macro = True
+    else:
+        assess_row = await fetch_one(
+            db,
+            "SELECT id, title, macro_assessment_id FROM assessments WHERE id = CAST(:id AS uuid)",
+            {"id": str(route_id)},
+        )
+        if not assess_row:
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND, "Avaliação/macro avaliação não encontrada"
+            )
+        macro_fk = assess_row.get("macro_assessment_id")
+        if macro_fk:
+            macro_id = str(macro_fk)
+            is_macro = True
+            mt = await fetch_one(
+                db,
+                "SELECT title FROM macro_assessments WHERE id = CAST(:id AS uuid)",
+                {"id": macro_id},
+            )
+            macro_title = (mt or {}).get("title") or assess_row.get("title") or ""
+        else:
+            macro_id = None
+            macro_title = assess_row.get("title") or ""
+
+    sids = [str(s) for s in school_ids]
+
+    # Cadernos da macro (ou o caderno avulso) agendados em alguma turma da escola.
+    if is_macro and macro_id is not None:
+        assessments = await fetch_all(
+            db,
+            """
+            SELECT DISTINCT a.id, a.title, a.description, a.type, a.created_at
+            FROM assessments a
+            JOIN assessment_schedules s ON s.assessment_id = a.id
+            JOIN classrooms c ON c.id = s.classroom_id
+            WHERE a.macro_assessment_id = CAST(:mid AS uuid)
+              AND c.school_id = ANY(CAST(:sids AS uuid[]))
+            ORDER BY a.created_at, a.title
+            """,
+            {"mid": macro_id, "sids": sids},
+        )
+    else:
+        assessments = await fetch_all(
+            db,
+            """
+            SELECT DISTINCT a.id, a.title, a.description, a.type, a.created_at
+            FROM assessments a
+            JOIN assessment_schedules s ON s.assessment_id = a.id
+            JOIN classrooms c ON c.id = s.classroom_id
+            WHERE a.id = CAST(:id AS uuid)
+              AND c.school_id = ANY(CAST(:sids AS uuid[]))
+            """,
+            {"id": str(route_id), "sids": sids},
+        )
+
+    assessment_ids = [str(a["id"]) for a in assessments]
+    if not assessment_ids:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            "Nenhum caderno desta macro avaliação está agendado nesta escola",
+        )
+
+    classroom_rows = await fetch_all(
+        db,
+        """
+        SELECT DISTINCT c.id, c.name
+        FROM classrooms c
+        JOIN assessment_schedules s ON s.classroom_id = c.id
+        WHERE s.assessment_id = ANY(CAST(:aids AS uuid[]))
+          AND c.school_id = ANY(CAST(:sids AS uuid[]))
+        ORDER BY c.name
+        """,
+        {"aids": assessment_ids, "sids": sids},
+    )
+    classrooms = [{"id": str(r["id"]), "name": r.get("name") or ""} for r in classroom_rows]
+    classroom_ids = [c["id"] for c in classrooms]
+
+    return {
+        "macro_id": macro_id,
+        "macro_title": macro_title,
+        "is_macro": is_macro,
+        "assessments": [
+            {
+                "id": str(a["id"]),
+                "title": a.get("title") or "",
+                "description": a.get("description"),
+                "type": a.get("type"),
+            }
+            for a in assessments
+        ],
+        "assessment_ids": assessment_ids,
+        "classrooms": classrooms,
+        "classroom_ids": classroom_ids,
+    }
+
+
+async def macro_components_report_for_classrooms(
+    db: AsyncSession,
+    *,
+    assessment_ids: list[str],
+    classroom_ids: list[str],
+) -> dict[str, Any]:
+    """Componentes consolidados da macro avaliação para um conjunto de turmas.
+
+    Versão multi-turma (escola): soma itens/acertos das turmas em ``classroom_ids``;
+    médias usam acurácia por aluno. ``systemAverage`` considera todas as turmas que
+    responderam aos cadernos (base do sistema).
+    """
+    avg_row = await fetch_one(
+        db,
+        """
+        WITH per_student AS (
+            SELECT student_id, classroom_id,
+                   SUM(total_questions) AS tq, SUM(correct_answers) AS ca
+            FROM vw_assessment_component_results
+            WHERE assessment_id = ANY(CAST(:aids AS uuid[]))
+            GROUP BY student_id, classroom_id
+        ), acc AS (
+            SELECT student_id, classroom_id,
+                   CASE WHEN tq > 0 THEN 100.0 * ca / tq ELSE 0 END AS accuracy
+            FROM per_student
+        )
+        SELECT
+            AVG(accuracy) FILTER (WHERE classroom_id = ANY(CAST(:cids AS uuid[]))) AS school_avg,
+            AVG(accuracy) AS system_avg
+        FROM acc
+        """,
+        {"aids": assessment_ids, "cids": classroom_ids},
+    )
+    school_avg = float((avg_row or {}).get("school_avg") or 0.0)
+    system_avg = float((avg_row or {}).get("system_avg") or 0.0)
+
+    comp_rows = await fetch_all(
+        db,
+        """
+        SELECT discipline_name, discipline_slug, area_slug,
+               SUM(total_questions) AS sum_tq,
+               SUM(correct_answers) AS sum_ca
+        FROM vw_assessment_component_results
+        WHERE assessment_id = ANY(CAST(:aids AS uuid[]))
+          AND classroom_id = ANY(CAST(:cids AS uuid[]))
+        GROUP BY discipline_name, discipline_slug, area_slug
+        ORDER BY discipline_name
+        """,
+        {"aids": assessment_ids, "cids": classroom_ids},
+    )
+
+    areas = await fetch_all(db, "SELECT slug, name FROM curricular_areas", {})
+    area_name_by_slug = {str(a["slug"]): a.get("name") for a in areas}
+
+    def _area_name(slug: Any, fallback: str) -> str:
+        if slug and str(slug) in area_name_by_slug:
+            return str(area_name_by_slug[str(slug)])
+        return fallback
+
+    component_performance: list[dict[str, Any]] = []
+    for r in comp_rows:
+        name = str(r.get("discipline_name") or "Sem componente")
+        tq = int(r.get("sum_tq") or 0)
+        ca = int(r.get("sum_ca") or 0)
+        accuracy = round((100.0 * ca / tq), 1) if tq else 0.0
+        variation = 0.0
+        component_performance.append(
+            {
+                "componentId": str(r.get("discipline_slug") or name),
+                "componentName": name,
+                "areaName": _area_name(r.get("area_slug"), name),
+                "totalQuestions": tq,
+                "correctAnswers": ca,
+                "studentAccuracy": accuracy,
+                "comparisonAverage": accuracy,
+                "variationPercentagePoints": variation,
+                "pedagogicalAction": _pedagogical_action(variation),
+            }
+        )
+
+    total_row = await fetch_one(
+        db,
+        """
+        SELECT COUNT(*)::int AS n
+        FROM questions_assessments
+        WHERE assessment_id = ANY(CAST(:aids AS uuid[]))
+        """,
+        {"aids": assessment_ids},
+    )
+    total_q = int((total_row or {}).get("n") or 0)
+
+    summary = {
+        "totalQuestions": total_q,
+        "correctAnswers": 0,
+        "accuracyPercentage": round(school_avg, 1),
+        "classroomAverage": round(school_avg, 1),
+        "schoolAverage": round(school_avg, 1),
+        "systemAverage": round(system_avg, 1),
+    }
+
+    return {
+        "summary": summary,
+        "componentPerformance": component_performance,
+        "pedagogicalReading": _build_pedagogical_reading(component_performance),
+    }
+
+
+async def macro_students_report_for_classrooms(
+    db: AsyncSession,
+    *,
+    assessment_ids: list[str],
+    classroom_ids: list[str],
+) -> dict[str, Any]:
+    """Desempenho por aluno consolidando a macro para um conjunto de turmas.
+
+    Uma linha por (aluno, caderno) em qualquer turma de ``classroom_ids``; inclui
+    ``classroomName`` para identificar a turma de cada linha.
+    """
+    rows = await fetch_all(
+        db,
+        """
+        SELECT ar.student_id,
+               COALESCE(p.full_name, '') AS full_name,
+               ar.assessment_id,
+               a.title AS assessment_title,
+               ar.classroom_id,
+               cl.name AS classroom_name,
+               ar.status,
+               ar.score,
+               ar.submitted_at
+        FROM assessment_results ar
+        JOIN assessments a ON a.id = ar.assessment_id
+        LEFT JOIN classrooms cl ON cl.id = ar.classroom_id
+        LEFT JOIN vw_profiles p ON p.id = ar.student_id
+        WHERE ar.classroom_id = ANY(CAST(:cids AS uuid[]))
+          AND ar.assessment_id = ANY(CAST(:aids AS uuid[]))
+        ORDER BY cl.name NULLS LAST, p.full_name NULLS LAST, a.title
+        """,
+        {"aids": assessment_ids, "cids": classroom_ids},
+    )
+
+    correct_rows = await fetch_all(
+        db,
+        """
+        SELECT student_id, assessment_id, classroom_id,
+               SUM(total_questions) AS tq, SUM(correct_answers) AS ca
+        FROM vw_assessment_component_results
+        WHERE assessment_id = ANY(CAST(:aids AS uuid[]))
+          AND classroom_id = ANY(CAST(:cids AS uuid[]))
+        GROUP BY student_id, assessment_id, classroom_id
+        """,
+        {"aids": assessment_ids, "cids": classroom_ids},
+    )
+    correct_by: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for r in correct_rows:
+        key = (str(r.get("student_id")), str(r.get("assessment_id")), str(r.get("classroom_id")))
+        correct_by[key] = r
+
+    base_rows = await fetch_all(
+        db,
+        """
+        SELECT assessment_id, COUNT(*)::int AS n
+        FROM questions_assessments
+        WHERE assessment_id = ANY(CAST(:aids AS uuid[]))
+        GROUP BY assessment_id
+        """,
+        {"aids": assessment_ids},
+    )
+    base_by = {str(r.get("assessment_id")): int(r.get("n") or 0) for r in base_rows}
+
+    items: list[dict[str, Any]] = []
+    for r in rows:
+        sid = str(r.get("student_id"))
+        aid = str(r.get("assessment_id"))
+        cid = str(r.get("classroom_id"))
+        agg = correct_by.get((sid, aid, cid)) or {}
+        correct = int(agg.get("ca") or 0)
+        answered = int(agg.get("tq") or 0)
+        total = base_by.get(aid) or answered
+        accuracy = round((100.0 * correct / total), 1) if total else None
+        items.append(
+            {
+                "studentId": sid,
+                "studentName": r.get("full_name") or "",
+                "assessmentId": aid,
+                "assessmentTitle": r.get("assessment_title") or "",
+                "classroomId": cid,
+                "classroomName": r.get("classroom_name") or "",
+                "status": r.get("status"),
+                "score": float(r["score"]) if r.get("score") is not None else None,
+                "correctAnswers": correct,
+                "totalQuestions": total,
+                "accuracyPercentage": accuracy,
+                "submittedAt": str(r["submitted_at"]) if r.get("submitted_at") else None,
+            }
+        )
+
+    return {"items": items}
+
+
 async def _classroom_head(db: AsyncSession, classroom_id: UUID) -> dict[str, Any]:
     row = await fetch_one(
         db,
