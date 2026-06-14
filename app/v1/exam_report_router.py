@@ -848,10 +848,20 @@ async def report_assessment_pedagogical_v1(
     db: Annotated[AsyncSession, Depends(get_db)],
     classroom_id: UUID = Query(..., description="Turma do relatório (obrigatório)."),
     student_id: UUID | None = Query(None, description="Aluno (omitido = consolidado da turma)."),
-    academic_year_id: UUID | None = Query(None, description="Ano letivo. Se omitido, usa is_primary=true."),
+    academic_year_id: UUID | None = Query(None, description="Ano letivo. Se omitido, usa o da turma."),
 ):
     """Relatório pedagógico por componente curricular (variação intervir/orientar/desafiar)."""
-    effective_ay = await resolve_academic_year_id(db, academic_year_id)
+    c_row = await load_classroom_row_by_id(db, classroom_id)
+    if not c_row:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Turma não encontrada")
+    classroom_ay = UUID(str(c_row["academic_year_id"]))
+    if academic_year_id is not None and str(academic_year_id) != str(classroom_ay):
+        logger.warning(
+            "[v1/reports/pedagogical] academic_year_id=%s difere da turma %s — usando %s",
+            academic_year_id,
+            classroom_id,
+            classroom_ay,
+        )
     await assert_actor_can_read_classroom(db, ctx, classroom_id)
     if student_id is not None:
         await assert_can_access_assessment_report_student(
@@ -861,7 +871,7 @@ async def report_assessment_pedagogical_v1(
         db,
         assessment_id=assessment_id,
         classroom_id=classroom_id,
-        academic_year_id=effective_ay,
+        academic_year_id=classroom_ay,
         student_id=student_id,
     )
 

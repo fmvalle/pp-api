@@ -10,7 +10,13 @@ from fastapi import HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.deps import AuthContext
-from app.v1._scope import get_effective_classroom_scope, get_effective_school_scope, is_admin_like, is_teacher_like
+from app.v1._scope import (
+    get_effective_classroom_scope,
+    get_effective_school_scope,
+    is_admin_like,
+    is_staff_admin_role,
+    is_teacher_like,
+)
 from app.v1._sql import fetch_all, fetch_one
 
 logger = logging.getLogger(__name__)
@@ -26,6 +32,19 @@ async def assert_can_access_assessment_report_student(
     """Aluno (self), admin, professor com vínculo turma+resultado, ou staff da escola do aluno."""
     if is_admin_like(ctx.role):
         return
+    if is_staff_admin_role(ctx.role):
+        prow = await fetch_one(
+            db,
+            "SELECT school_id FROM vw_profiles WHERE id = CAST(:id AS uuid)",
+            {"id": str(student_id)},
+        )
+        if not prow:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Student not found")
+        sscope = await get_effective_school_scope(db, ctx)
+        pschool = prow.get("school_id")
+        if pschool and str(pschool) in {str(x) for x in (sscope["effective_school_ids"] or [])}:
+            return
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Fora do escopo")
     if str(student_id) == str(ctx.active_profile_id):
         return
     if is_teacher_like(ctx.role):
@@ -389,6 +408,78 @@ def _build_pedagogical_reading(components: list[dict[str, Any]]) -> dict[str, An
     }
 
 
+# SQL inline (não depende das views da migração 008) — evita 500 quando
+# curricular_areas / vw_assessment_component_results / vw_question_item_stats
+# ainda não foram aplicadas no banco.
+_COMPONENT_RESULTS_SQL = """
+WITH last_resp AS (
+    SELECT DISTINCT ON (qsr.student_id, qsr.question_id)
+           qsr.student_id, qsr.question_id, qsr.response_id,
+           qsr.assessment_id, qsr.schedule_id
+      FROM question_student_responsed qsr
+     WHERE qsr.assessment_id = CAST(:aid AS uuid)
+       AND qsr.response_id IS NOT NULL
+     ORDER BY qsr.student_id, qsr.question_id, qsr.updated_at DESC NULLS LAST
+)
+SELECT COALESCE(ass.classroom_id, CAST(:cid AS uuid)) AS classroom_id,
+       lr.assessment_id,
+       lr.student_id,
+       COALESCE(qi.discipline_name, 'Sem componente') AS discipline_name,
+       qi.discipline_slug,
+       qi.area_slug,
+       count(*)::int AS total_questions,
+       count(*) FILTER (WHERE qa.is_correct = true)::int AS correct_answers,
+       CASE WHEN count(*) > 0
+            THEN 100.0 * count(*) FILTER (WHERE qa.is_correct = true) / count(*)
+            ELSE 0 END AS acc
+  FROM last_resp lr
+  JOIN question_alternative qa ON qa.id = lr.response_id
+  JOIN question_item qi ON qi.id = lr.question_id
+  LEFT JOIN assessment_schedules ass ON ass.id = lr.schedule_id
+ WHERE COALESCE(ass.classroom_id, CAST(:cid AS uuid)) = CAST(:cid AS uuid)
+ GROUP BY COALESCE(ass.classroom_id, CAST(:cid AS uuid)),
+          lr.assessment_id, lr.student_id,
+          qi.discipline_name, qi.discipline_slug, qi.area_slug
+"""
+
+_QUESTION_STATS_SQL = """
+WITH last_resp AS (
+    SELECT DISTINCT ON (qsr.student_id, qsr.question_id)
+           qsr.student_id, qsr.question_id, qsr.response_id,
+           qsr.assessment_id, qsr.schedule_id
+      FROM question_student_responsed qsr
+     WHERE qsr.assessment_id = CAST(:aid AS uuid)
+       AND qsr.response_id IS NOT NULL
+     ORDER BY qsr.student_id, qsr.question_id, qsr.updated_at DESC NULLS LAST
+), resp AS (
+    SELECT lr.assessment_id,
+           lr.question_id,
+           ass.classroom_id,
+           ass.school_id,
+           qa.is_correct
+      FROM last_resp lr
+      JOIN question_alternative qa ON qa.id = lr.response_id
+      LEFT JOIN assessment_schedules ass ON ass.id = lr.schedule_id
+)
+SELECT question_id,
+       count(*) FILTER (WHERE school_id = CAST(:sid AS uuid))::int AS school_resp,
+       count(*) FILTER (WHERE school_id = CAST(:sid AS uuid) AND is_correct)::int AS school_corr,
+       count(*)::int AS sys_resp,
+       count(*) FILTER (WHERE is_correct)::int AS sys_corr
+  FROM resp
+ GROUP BY question_id
+"""
+
+
+async def _load_area_name_map(db: AsyncSession) -> dict[str, str]:
+    try:
+        areas = await fetch_all(db, "SELECT slug, name FROM curricular_areas", {})
+        return {str(a["slug"]): str(a.get("name") or "") for a in areas}
+    except Exception as exc:
+        logger.warning("[v1/reports/pedagogical] curricular_areas indisponível: %s", exc)
+        return {}
+
+
 async def assessment_pedagogical_report_bundle(
     db: AsyncSession,
     *,
@@ -404,19 +495,23 @@ async def assessment_pedagogical_report_bundle(
         SELECT a.id AS assessment_id, a.title AS assessment_title, a.created_at AS assessment_date,
                a.type AS assessment_type,
                c.id AS classroom_id, c.name AS classroom_name,
-               s.name AS school_name, c.school_id
+               s.name AS school_name, c.school_id, c.academic_year_id
         FROM classrooms c
         JOIN assessments a ON a.id = CAST(:aid AS uuid)
         LEFT JOIN schools s ON s.id = c.school_id
         WHERE c.id = CAST(:cid AS uuid)
-          AND c.academic_year_id = CAST(:ay AS uuid)
         """,
-        {"aid": str(assessment_id), "cid": str(classroom_id), "ay": str(academic_year_id)},
+        {"aid": str(assessment_id), "cid": str(classroom_id)},
     )
     if not head:
-        raise HTTPException(
-            status.HTTP_404_NOT_FOUND,
-            "Turma não encontrada para a avaliação/ano letivo informados",
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Turma não encontrada")
+    if str(head.get("academic_year_id") or "") != str(academic_year_id):
+        logger.info(
+            "[v1/reports/pedagogical] academic_year mismatch classroom_id=%s "
+            "classroom_ay=%s requested_ay=%s — usando ano da turma",
+            classroom_id,
+            head.get("academic_year_id"),
+            academic_year_id,
         )
     school_id = head.get("school_id")
     # Provas adaptativas só apresentam itens efetivamente respondidos (a base é
@@ -444,21 +539,25 @@ async def assessment_pedagogical_report_bundle(
             "registrationCode": prof.get("registration_code") or prof.get("code"),
         }
 
+    comp_base_params = {"aid": str(assessment_id), "cid": str(classroom_id)}
+
     # --- Médias agregadas (acurácia média por aluno: turma/escola/sistema) ----
     avg_row = await fetch_one(
         db,
-        """
-        WITH per_student AS (
+        f"""
+        WITH comp AS ({_COMPONENT_RESULTS_SQL}),
+        per_student AS (
             SELECT student_id, classroom_id,
-                   SUM(total_questions) AS tq, SUM(correct_answers) AS ca
-            FROM vw_assessment_component_results
-            WHERE assessment_id = CAST(:aid AS uuid)
-            GROUP BY student_id, classroom_id
-        ), acc AS (
+                   SUM(total_questions) AS tq,
+                   SUM(correct_answers) AS ca
+              FROM comp
+             GROUP BY student_id, classroom_id
+        ),
+        acc AS (
             SELECT ps.student_id, ps.classroom_id, c.school_id,
                    CASE WHEN ps.tq > 0 THEN 100.0 * ps.ca / ps.tq ELSE 0 END AS accuracy
-            FROM per_student ps
-            JOIN classrooms c ON c.id = ps.classroom_id
+              FROM per_student ps
+              JOIN classrooms c ON c.id = ps.classroom_id
         )
         SELECT
             AVG(accuracy) FILTER (WHERE classroom_id = CAST(:cid AS uuid)) AS classroom_avg,
@@ -466,7 +565,7 @@ async def assessment_pedagogical_report_bundle(
             AVG(accuracy) AS system_avg
         FROM acc
         """,
-        {"aid": str(assessment_id), "cid": str(classroom_id), "sid": str(school_id)},
+        {**comp_base_params, "sid": str(school_id)},
     )
     classroom_avg = float((avg_row or {}).get("classroom_avg") or 0.0)
     school_avg = float((avg_row or {}).get("school_avg") or 0.0)
@@ -475,47 +574,52 @@ async def assessment_pedagogical_report_bundle(
     # --- Componentes (acurácia por disciplina) --------------------------------
     comp_rows = await fetch_all(
         db,
-        """
-        WITH comp AS (
-            SELECT student_id, discipline_name, discipline_slug, area_slug,
-                   total_questions, correct_answers,
-                   CASE WHEN total_questions > 0
-                        THEN 100.0 * correct_answers / total_questions ELSE 0 END AS acc
-            FROM vw_assessment_component_results
-            WHERE assessment_id = CAST(:aid AS uuid)
-              AND classroom_id = CAST(:cid AS uuid)
-        )
+        f"""
+        WITH comp AS ({_COMPONENT_RESULTS_SQL})
         SELECT discipline_name, discipline_slug, area_slug,
                AVG(acc) AS classroom_acc,
                SUM(total_questions) AS sum_tq,
                SUM(correct_answers) AS sum_ca
-        FROM comp
-        GROUP BY discipline_name, discipline_slug, area_slug
-        ORDER BY discipline_name
+          FROM comp
+         GROUP BY discipline_name, discipline_slug, area_slug
+         ORDER BY discipline_name
         """,
-        {"aid": str(assessment_id), "cid": str(classroom_id)},
+        comp_base_params,
     )
+    if not comp_rows:
+        comp_rows = await fetch_all(
+            db,
+            """
+            SELECT COALESCE(qi.discipline_name, 'Sem componente') AS discipline_name,
+                   qi.discipline_slug,
+                   qi.area_slug,
+                   0.0 AS classroom_acc,
+                   COUNT(*)::int AS sum_tq,
+                   0 AS sum_ca
+              FROM questions_assessments qa
+              JOIN question_item qi ON qi.id = qa.question_id
+             WHERE qa.assessment_id = CAST(:aid AS uuid)
+             GROUP BY qi.discipline_name, qi.discipline_slug, qi.area_slug
+             ORDER BY discipline_name
+            """,
+            {"aid": str(assessment_id)},
+        )
     student_comp: dict[str, dict[str, Any]] = {}
     if student_id is not None:
         srows = await fetch_all(
             db,
-            """
+            f"""
             SELECT discipline_name, discipline_slug, area_slug,
-                   total_questions, correct_answers,
-                   CASE WHEN total_questions > 0
-                        THEN 100.0 * correct_answers / total_questions ELSE 0 END AS acc
-            FROM vw_assessment_component_results
-            WHERE assessment_id = CAST(:aid AS uuid)
-              AND classroom_id = CAST(:cid AS uuid)
-              AND student_id = CAST(:sid AS uuid)
+                   total_questions, correct_answers, acc
+              FROM ({_COMPONENT_RESULTS_SQL}) comp
+             WHERE student_id = CAST(:sid AS uuid)
             """,
-            {"aid": str(assessment_id), "cid": str(classroom_id), "sid": str(student_id)},
+            {**comp_base_params, "sid": str(student_id)},
         )
         for r in srows:
             student_comp[str(r.get("discipline_name") or "")] = r
 
-    areas = await fetch_all(db, "SELECT slug, name FROM curricular_areas", {})
-    area_name_by_slug = {str(a["slug"]): a.get("name") for a in areas}
+    area_name_by_slug = await _load_area_name_map(db)
 
     def _area_name(slug: Any, fallback: str) -> str:
         if slug and str(slug) in area_name_by_slug:
@@ -595,11 +699,13 @@ async def assessment_pedagogical_report_bundle(
         db,
         """
         SELECT qit.question_id, qt.tag_type, qt.external_id AS code, qt.label AS description
-        FROM question_item_tag qit
+        FROM questions_assessments qa
+        JOIN question_item_tag qit ON qit.question_id = qa.question_id
         JOIN question_tag qt ON qt.id = qit.tag_id
-        WHERE qt.tag_type IN ('skill', 'topic')
+        WHERE qa.assessment_id = CAST(:aid AS uuid)
+          AND qt.tag_type IN ('skill', 'topic')
         """,
-        {},
+        {"aid": str(assessment_id)},
     )
     skill_by_q: dict[str, dict[str, Any]] = {}
     for sr in skill_rows:
@@ -612,16 +718,7 @@ async def assessment_pedagogical_report_bundle(
 
     stat_rows = await fetch_all(
         db,
-        """
-        SELECT question_id,
-               SUM(responses) FILTER (WHERE school_id = CAST(:sid AS uuid)) AS school_resp,
-               SUM(correct)   FILTER (WHERE school_id = CAST(:sid AS uuid)) AS school_corr,
-               SUM(responses) AS sys_resp,
-               SUM(correct) AS sys_corr
-        FROM vw_question_item_stats
-        WHERE assessment_id = CAST(:aid AS uuid)
-        GROUP BY question_id
-        """,
+        _QUESTION_STATS_SQL,
         {"aid": str(assessment_id), "sid": str(school_id)},
     )
     stat_by_q: dict[str, dict[str, Any]] = {str(r.get("question_id")): r for r in stat_rows}
@@ -676,11 +773,24 @@ async def assessment_pedagogical_report_bundle(
         ans_rows = await fetch_all(
             db,
             """
-            SELECT question_id, label, is_correct, correct_alternative
-            FROM vw_student_answers_report
-            WHERE student_id = CAST(:sid AS uuid)
-              AND assessment_id = CAST(:aid AS uuid)
-              AND classroom_id = CAST(:cid AS uuid)
+            SELECT DISTINCT ON (qsr.question_id)
+                   qsr.question_id,
+                   alt.label,
+                   alt.is_correct,
+                   (SELECT ca.label
+                      FROM question_alternative ca
+                     WHERE ca.question_id = qsr.question_id
+                       AND ca.is_correct = true
+                     ORDER BY ca.order_index NULLS LAST
+                     LIMIT 1) AS correct_alternative
+              FROM question_student_responsed qsr
+              JOIN question_alternative alt ON alt.id = qsr.response_id
+              LEFT JOIN assessment_schedules ass ON ass.id = qsr.schedule_id
+             WHERE qsr.student_id = CAST(:sid AS uuid)
+               AND qsr.assessment_id = CAST(:aid AS uuid)
+               AND qsr.response_id IS NOT NULL
+               AND COALESCE(ass.classroom_id, CAST(:cid AS uuid)) = CAST(:cid AS uuid)
+             ORDER BY qsr.question_id, qsr.updated_at DESC NULLS LAST
             """,
             {"sid": str(student_id), "aid": str(assessment_id), "cid": str(classroom_id)},
         )
