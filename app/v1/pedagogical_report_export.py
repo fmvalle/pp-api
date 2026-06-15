@@ -129,7 +129,7 @@ def build_pedagogical_report_pdf_bytes(bundle: dict[str, Any]) -> bytes:
         ["Acerto do aluno", _fmt_pct(summary.get("accuracyPercentage"))],
         ["Média da turma", _fmt_pct(summary.get("classroomAverage"))],
         ["Média da escola", _fmt_pct(summary.get("schoolAverage"))],
-        ["Média do sistema", _fmt_pct(summary.get("systemAverage"))],
+        ["Média geral", _fmt_pct(summary.get("systemAverage"))],
     ]
     summary_table = Table(summary_rows, colWidths=[doc.width * 0.55, doc.width * 0.45])
     summary_table.setStyle(
@@ -313,7 +313,7 @@ def build_pedagogical_report_xlsx_bytes(bundle: dict[str, Any]) -> bytes:
         ("Acerto do aluno (%)", summary.get("accuracyPercentage")),
         ("Média da turma (%)", summary.get("classroomAverage")),
         ("Média da escola (%)", summary.get("schoolAverage")),
-        ("Média do sistema (%)", summary.get("systemAverage")),
+        ("Média geral (%)", summary.get("systemAverage")),
         ("Leitura pedagógica", reading.get("text")),
     ]
     row = 3

@@ -442,6 +442,40 @@ SELECT COALESCE(ass.classroom_id, CAST(:cid AS uuid)) AS classroom_id,
           qi.discipline_name, qi.discipline_slug, qi.area_slug
 """
 
+# Médias do resumo (turma / escola / sistema) — sem recorte à turma do relatório.
+# Usa o agendamento real de cada resposta para atribuir aluno → turma → escola.
+_SUMMARY_AVERAGES_SQL = """
+WITH last_resp AS (
+    SELECT DISTINCT ON (qsr.student_id, qsr.question_id)
+           qsr.student_id, qsr.question_id, qsr.response_id,
+           qsr.assessment_id, qsr.schedule_id
+      FROM question_student_responsed qsr
+     WHERE qsr.assessment_id = CAST(:aid AS uuid)
+       AND qsr.response_id IS NOT NULL
+     ORDER BY qsr.student_id, qsr.question_id, qsr.updated_at DESC NULLS LAST
+), per_student AS (
+    SELECT ass.classroom_id,
+           lr.student_id,
+           c.school_id,
+           count(*)::int AS tq,
+           count(*) FILTER (WHERE qa.is_correct = true)::int AS ca
+      FROM last_resp lr
+      JOIN question_alternative qa ON qa.id = lr.response_id
+      JOIN assessment_schedules ass ON ass.id = lr.schedule_id
+      JOIN classrooms c ON c.id = ass.classroom_id
+     GROUP BY ass.classroom_id, lr.student_id, c.school_id
+), acc AS (
+    SELECT student_id, classroom_id, school_id,
+           CASE WHEN tq > 0 THEN 100.0 * ca / tq ELSE 0 END AS accuracy
+      FROM per_student
+)
+SELECT
+    AVG(accuracy) FILTER (WHERE classroom_id = CAST(:cid AS uuid)) AS classroom_avg,
+    AVG(accuracy) FILTER (WHERE school_id = CAST(:sid AS uuid)) AS school_avg,
+    AVG(accuracy) AS system_avg
+FROM acc
+"""
+
 _QUESTION_STATS_SQL = """
 WITH last_resp AS (
     SELECT DISTINCT ON (qsr.student_id, qsr.question_id)
@@ -544,28 +578,8 @@ async def assessment_pedagogical_report_bundle(
     # --- Médias agregadas (acurácia média por aluno: turma/escola/sistema) ----
     avg_row = await fetch_one(
         db,
-        f"""
-        WITH comp AS ({_COMPONENT_RESULTS_SQL}),
-        per_student AS (
-            SELECT student_id, classroom_id,
-                   SUM(total_questions) AS tq,
-                   SUM(correct_answers) AS ca
-              FROM comp
-             GROUP BY student_id, classroom_id
-        ),
-        acc AS (
-            SELECT ps.student_id, ps.classroom_id, c.school_id,
-                   CASE WHEN ps.tq > 0 THEN 100.0 * ps.ca / ps.tq ELSE 0 END AS accuracy
-              FROM per_student ps
-              JOIN classrooms c ON c.id = ps.classroom_id
-        )
-        SELECT
-            AVG(accuracy) FILTER (WHERE classroom_id = CAST(:cid AS uuid)) AS classroom_avg,
-            AVG(accuracy) FILTER (WHERE school_id = CAST(:sid AS uuid)) AS school_avg,
-            AVG(accuracy) AS system_avg
-        FROM acc
-        """,
-        {**comp_base_params, "sid": str(school_id)},
+        _SUMMARY_AVERAGES_SQL,
+        {"aid": str(assessment_id), "cid": str(classroom_id), "sid": str(school_id)},
     )
     classroom_avg = float((avg_row or {}).get("classroom_avg") or 0.0)
     school_avg = float((avg_row or {}).get("school_avg") or 0.0)
