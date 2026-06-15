@@ -4,7 +4,7 @@ import logging
 from typing import Annotated, Any
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -21,6 +21,7 @@ from app.v1._scope import (
     resolve_admin_dashboard_school_ids,
 )
 from app.v1._sql import execute, fetch_all, fetch_one
+from app.v1.attendance_sheet_storage import load_attendance_sheet_bytes
 from app.v1.directory_router import _student_scope_read
 from app.v1.macro_report import (
     macro_components_report,
@@ -1182,6 +1183,17 @@ async def _resolve_school_ids(
     return ids
 
 
+def _scheduling_window_fields(row: dict[str, Any]) -> dict[str, Any]:
+    """Campos de vigência para habilitar/desabilitar agendamento no app."""
+    start = row.get("start_date")
+    end = row.get("end_date")
+    return {
+        "startDate": start.isoformat() if hasattr(start, "isoformat") else start,
+        "endDate": end.isoformat() if hasattr(end, "isoformat") else end,
+        "schedulingAvailable": bool(row.get("scheduling_available")),
+    }
+
+
 @router.get("/school-admin/schools/{school_id}/macro-assessments")
 async def school_admin_macro_assessments_v1(
     school_id: UUID,
@@ -1206,12 +1218,21 @@ async def school_admin_macro_assessments_v1(
            MIN(v.type) AS type,
            MIN(v.year) AS year,
            bool_or(v.is_active) AS is_active,
+           MIN(ma.start_date) AS start_date,
+           MIN(ma.end_date) AS end_date,
+           bool_or(
+             ma.start_date IS NOT NULL
+             AND ma.end_date IS NOT NULL
+             AND ma.start_date <= (now() AT TIME ZONE 'utc')
+             AND ma.end_date >= (now() AT TIME ZONE 'utc')
+           ) AS scheduling_available,
            COUNT(DISTINCT v.classroom_id) AS classrooms,
            COALESCE(SUM(v.pending), 0)::int AS pending,
            COALESCE(SUM(v.completed), 0)::int AS completed,
            COALESCE(SUM(v.did_not_deliver), 0)::int AS did_not_deliver
     FROM vw_macro_assessment_summary v
     JOIN classrooms c ON c.id = v.classroom_id
+    LEFT JOIN macro_assessments ma ON ma.id = v.macro_assessment_id
     WHERE v.macro_assessment_id IS NOT NULL
       AND c.school_id = ANY(CAST(:sids AS uuid[]))
       AND c.academic_year_id = CAST(:ay AS uuid)
@@ -1227,6 +1248,15 @@ async def school_admin_macro_assessments_v1(
            MIN(vas.type) AS type,
            MIN(vas.year) AS year,
            bool_or(vas.is_active) AS is_active,
+           MIN(ash.start_availability) AS start_date,
+           MIN(ash.end_availability) AS end_date,
+           bool_or(
+             ash.start_availability IS NOT NULL
+             AND ash.end_availability IS NOT NULL
+             AND ash.start_availability <= (now() AT TIME ZONE 'utc')
+             AND ash.end_availability >= (now() AT TIME ZONE 'utc')
+             AND ash.active = true
+           ) AS scheduling_available,
            COUNT(DISTINCT vas.classroom_id) AS classrooms,
            COALESCE(SUM(vas.pending), 0)::int AS pending,
            COALESCE(SUM(vas.completed), 0)::int AS completed,
@@ -1234,6 +1264,8 @@ async def school_admin_macro_assessments_v1(
     FROM vw_assessment_summary vas
     JOIN classrooms c ON c.id = vas.classroom_id
     JOIN assessments a ON a.id = vas.assessment_id
+    JOIN assessment_school ash
+      ON ash.assessment_id = a.id AND ash.school_id = c.school_id
     WHERE a.macro_assessment_id IS NULL
       AND c.school_id = ANY(CAST(:sids AS uuid[]))
       AND c.academic_year_id = CAST(:ay AS uuid)
@@ -1258,6 +1290,7 @@ async def school_admin_macro_assessments_v1(
                 "pending": int(r.get("pending") or 0),
                 "completed": int(r.get("completed") or 0),
                 "didNotDeliver": int(r.get("did_not_deliver") or 0),
+                **_scheduling_window_fields(r),
             }
         )
     for r in legacy_rows:
@@ -1276,6 +1309,7 @@ async def school_admin_macro_assessments_v1(
                 "pending": int(r.get("pending") or 0),
                 "completed": int(r.get("completed") or 0),
                 "didNotDeliver": int(r.get("did_not_deliver") or 0),
+                **_scheduling_window_fields(r),
             }
         )
     items.sort(key=lambda x: (x["title"] or "").lower())
@@ -1383,6 +1417,100 @@ async def school_admin_macro_report_students_v1(
     scope = await resolve_macro_scope_school(db, route_id=macro_id, school_ids=school_ids)
     return await macro_students_report_for_classrooms(
         db, assessment_ids=scope["assessment_ids"], classroom_ids=scope["classroom_ids"]
+    )
+
+
+def _macro_pdf_table_missing(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return "macro_assessment_school_report_pdf" in msg and "does not exist" in msg
+
+
+async def _latest_macro_school_report_pdf(
+    db: AsyncSession,
+    *,
+    macro_id: UUID,
+    school_id: UUID,
+    report_type: str = "pedagogical",
+) -> dict[str, Any] | None:
+    try:
+        return await fetch_one(
+            db,
+            """
+            SELECT id, storage_key, original_filename, content_type,
+                   size_bytes, created_at, generation_status
+            FROM macro_assessment_school_report_pdf
+            WHERE macro_assessment_id = CAST(:mid AS uuid)
+              AND school_id = CAST(:sid AS uuid)
+              AND report_type = :rtype
+              AND generation_status = 'ready'
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            {"mid": str(macro_id), "sid": str(school_id), "rtype": report_type},
+        )
+    except Exception as exc:
+        if _macro_pdf_table_missing(exc):
+            return None
+        raise
+
+
+@router.get("/school-admin/macro-assessments/{macro_id}/report/pdf/meta")
+async def school_admin_macro_report_pdf_meta_v1(
+    macro_id: UUID,
+    ctx: Annotated[AuthContext, Depends(get_auth_context)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+    school_id: UUID = Query(..., description="Escola do gestor (obrigatório)."),
+    report_type: str = Query("pedagogical", description="Tipo do relatório PDF."),
+):
+    """Indica se há PDF consolidado pronto para download (macro × escola)."""
+    await _resolve_school_ids(db, ctx, school_id)
+    row = await _latest_macro_school_report_pdf(
+        db, macro_id=macro_id, school_id=school_id, report_type=report_type
+    )
+    if not row:
+        return {"available": False}
+    return {
+        "available": True,
+        "id": str(row.get("id")),
+        "filename": row.get("original_filename") or "relatorio.pdf",
+        "contentType": row.get("content_type") or "application/pdf",
+        "sizeBytes": int(row.get("size_bytes") or 0),
+        "createdAt": str(row["created_at"]) if row.get("created_at") else None,
+        "reportType": report_type,
+    }
+
+
+@router.get("/school-admin/macro-assessments/{macro_id}/report/pdf")
+async def school_admin_macro_report_pdf_download_v1(
+    macro_id: UUID,
+    ctx: Annotated[AuthContext, Depends(get_auth_context)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+    school_id: UUID = Query(..., description="Escola do gestor (obrigatório)."),
+    report_type: str = Query("pedagogical", description="Tipo do relatório PDF."),
+):
+    """Download do PDF consolidado da macro avaliação para a escola."""
+    await _resolve_school_ids(db, ctx, school_id)
+    row = await _latest_macro_school_report_pdf(
+        db, macro_id=macro_id, school_id=school_id, report_type=report_type
+    )
+    if not row:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "PDF não disponível para esta avaliação e escola.")
+    storage_key = row.get("storage_key")
+    if not storage_key:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Arquivo PDF sem storage_key.")
+    try:
+        data = load_attendance_sheet_bytes(str(storage_key))
+    except FileNotFoundError:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            "Arquivo PDF não encontrado no storage. Verifique o upload.",
+        ) from None
+    filename = row.get("original_filename") or "relatorio.pdf"
+    cd = f'attachment; filename="{filename}"'
+    return Response(
+        content=data,
+        media_type=row.get("content_type") or "application/pdf",
+        headers={"Content-Disposition": cd},
     )
 
 

@@ -407,6 +407,9 @@ async def test_school_admin_macro_assessments_listing(monkeypatch):
                     "type": "printed",
                     "year": 2026,
                     "is_active": True,
+                    "start_date": "2026-01-01T00:00:00+00:00",
+                    "end_date": "2026-12-31T23:59:59+00:00",
+                    "scheduling_available": True,
                     "classrooms": 3,
                     "pending": 30,
                     "completed": 10,
@@ -431,6 +434,9 @@ async def test_school_admin_macro_assessments_listing(monkeypatch):
     assert item["isMacro"] is True
     assert item["classrooms"] == 3
     assert item["pending"] == 30
+    assert item["schedulingAvailable"] is True
+    assert item["startDate"] is not None
+    assert item["endDate"] is not None
 
 
 @pytest.mark.asyncio

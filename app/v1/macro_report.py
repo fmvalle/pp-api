@@ -20,6 +20,61 @@ from app.v1.report_bundle import _build_pedagogical_reading, _pedagogical_action
 logger = logging.getLogger(__name__)
 
 
+def _proficiency_table_missing(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return "student_assessment_area_proficiency" in msg and "does not exist" in msg
+
+
+async def _proficiencies_by_student_assessment(
+    db: AsyncSession,
+    *,
+    assessment_ids: list[str],
+    classroom_ids: list[str],
+) -> dict[tuple[str, str], list[dict[str, Any]]]:
+    """Proficiências por (student_id, assessment_id), agrupadas por área."""
+    if not assessment_ids or not classroom_ids:
+        return {}
+    try:
+        rows = await fetch_all(
+            db,
+            """
+            SELECT sap.student_id,
+                   sap.assessment_id,
+                   sap.area_slug,
+                   ca.name AS area_name,
+                   sap.proficiency,
+                   sap.level_code,
+                   pl.label AS level_label
+            FROM student_assessment_area_proficiency sap
+            JOIN curricular_areas ca ON ca.slug = sap.area_slug
+            LEFT JOIN proficiency_levels pl ON pl.code = sap.level_code
+            WHERE sap.assessment_id = ANY(CAST(:aids AS uuid[]))
+              AND sap.classroom_id = ANY(CAST(:cids AS uuid[]))
+            ORDER BY ca.name
+            """,
+            {"aids": assessment_ids, "cids": classroom_ids},
+        )
+    except Exception as exc:
+        if _proficiency_table_missing(exc):
+            logger.debug("student_assessment_area_proficiency ausente; proficiências omitidas")
+            return {}
+        raise
+
+    out: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for r in rows:
+        key = (str(r.get("student_id")), str(r.get("assessment_id")))
+        out.setdefault(key, []).append(
+            {
+                "areaSlug": r.get("area_slug"),
+                "areaName": r.get("area_name") or "",
+                "proficiency": float(r["proficiency"]) if r.get("proficiency") is not None else None,
+                "levelCode": r.get("level_code"),
+                "levelLabel": r.get("level_label"),
+            }
+        )
+    return out
+
+
 async def resolve_macro_scope(
     db: AsyncSession,
     *,
@@ -415,6 +470,10 @@ async def _students_for_classrooms(
     )
     base_by = {str(r.get("assessment_id")): int(r.get("n") or 0) for r in base_rows}
 
+    prof_by = await _proficiencies_by_student_assessment(
+        db, assessment_ids=assessment_ids, classroom_ids=classroom_ids
+    )
+
     items: list[dict[str, Any]] = []
     for r in rows:
         sid = str(r.get("student_id"))
@@ -439,6 +498,7 @@ async def _students_for_classrooms(
                 "totalQuestions": total,
                 "accuracyPercentage": accuracy,
                 "submittedAt": str(r["submitted_at"]) if r.get("submitted_at") else None,
+                "areaProficiencies": prof_by.get((sid, aid), []),
             }
         )
 
