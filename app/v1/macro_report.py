@@ -15,75 +15,13 @@ from fastapi import HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.v1._sql import fetch_all, fetch_one
+from app.v1.proficiency_report import (
+    average_proficiency_by_area,
+    proficiencies_by_student_assessment,
+)
 from app.v1.report_bundle import _build_pedagogical_reading, _pedagogical_action
 
 logger = logging.getLogger(__name__)
-
-
-def _proficiency_table_missing(exc: Exception) -> bool:
-    msg = str(exc).lower()
-    return "student_assessment_area_proficiency" in msg and "does not exist" in msg
-
-
-async def _proficiencies_by_student_assessment(
-    db: AsyncSession,
-    *,
-    assessment_ids: list[str],
-    classroom_ids: list[str] | None = None,
-) -> dict[tuple[str, str], list[dict[str, Any]]]:
-    """Proficiências por (student_id, assessment_id), agrupadas por área.
-
-    O vínculo único no banco é (student_id, assessment_id, area_slug); ``classroom_id``
-    na tabela é contexto e não entra na chave de exibição — filtrar só por turma costuma
-    ocultar linhas inseridas manualmente com classroom_id divergente.
-    """
-    if not assessment_ids:
-        return {}
-    try:
-        rows = await fetch_all(
-            db,
-            """
-            SELECT sap.student_id,
-                   sap.assessment_id,
-                   sap.area_slug,
-                   COALESCE(ca.name, sap.area_slug) AS area_name,
-                   sap.proficiency,
-                   sap.level_code,
-                   pl.label AS level_label
-            FROM student_assessment_area_proficiency sap
-            LEFT JOIN curricular_areas ca ON ca.slug = sap.area_slug
-            LEFT JOIN proficiency_levels pl ON pl.code = sap.level_code
-            WHERE sap.assessment_id = ANY(CAST(:aids AS uuid[]))
-            ORDER BY sap.area_slug
-            """,
-            {"aids": assessment_ids},
-        )
-    except Exception as exc:
-        if _proficiency_table_missing(exc):
-            logger.debug("student_assessment_area_proficiency ausente; proficiências omitidas")
-            return {}
-        raise
-
-    if not rows:
-        logger.info(
-            "[macro_report] nenhuma proficiência para assessment_ids=%s (classroom_ids=%s ignorados no filtro)",
-            len(assessment_ids),
-            len(classroom_ids or []),
-        )
-
-    out: dict[tuple[str, str], list[dict[str, Any]]] = {}
-    for r in rows:
-        key = (str(r.get("student_id")), str(r.get("assessment_id")))
-        out.setdefault(key, []).append(
-            {
-                "areaSlug": r.get("area_slug"),
-                "areaName": r.get("area_name") or "",
-                "proficiency": float(r["proficiency"]) if r.get("proficiency") is not None else None,
-                "levelCode": r.get("level_code"),
-                "levelLabel": r.get("level_label"),
-            }
-        )
-    return out
 
 
 async def resolve_macro_scope(
@@ -384,9 +322,14 @@ async def _component_performance(
     # os cadernos e a distribuição é igual entre eles, divide-se pelo nº de cadernos.
     num_cadernos = max(1, len(assessment_ids))
 
+    prof_avg_by_area = await average_proficiency_by_area(
+        db, assessment_ids=assessment_ids, classroom_ids=classroom_ids
+    )
+
     out: list[dict[str, Any]] = []
     for b in base_rows:
         name = str(b.get("discipline_name") or "Sem componente")
+        area_slug = str(b.get("area_slug") or "")
         base_q = int(b.get("base_questions") or 0)
         per_caderno = round(base_q / num_cadernos)
         rr = resp_by.get(_key(b.get("discipline_name"), b.get("discipline_slug"), b.get("area_slug"))) or {}
@@ -394,19 +337,22 @@ async def _component_performance(
         ca_resp = int(rr.get("ca") or 0)
         accuracy = round(100.0 * ca_resp / tq_resp, 1) if tq_resp > 0 else 0.0
         variation = 0.0
-        out.append(
-            {
-                "componentId": str(b.get("discipline_slug") or name),
-                "componentName": name,
-                "areaName": _area_name(b.get("area_slug"), name),
-                "totalQuestions": per_caderno,
-                "correctAnswers": ca_resp,
-                "studentAccuracy": accuracy,
-                "comparisonAverage": accuracy,
-                "variationPercentagePoints": variation,
-                "pedagogicalAction": _pedagogical_action(variation),
-            }
-        )
+        prof = prof_avg_by_area.get(area_slug) if area_slug else None
+        item: dict[str, Any] = {
+            "componentId": str(b.get("discipline_slug") or name),
+            "componentName": name,
+            "areaName": _area_name(b.get("area_slug"), name),
+            "areaSlug": area_slug or None,
+            "totalQuestions": per_caderno,
+            "correctAnswers": ca_resp,
+            "studentAccuracy": accuracy,
+            "comparisonAverage": accuracy,
+            "variationPercentagePoints": variation,
+            "pedagogicalAction": _pedagogical_action(variation),
+        }
+        if prof and prof.get("proficiency") is not None:
+            item["proficiency"] = round(float(prof["proficiency"]), 1)
+        out.append(item)
     return out
 
 
@@ -481,8 +427,8 @@ async def _students_for_classrooms(
     )
     base_by = {str(r.get("assessment_id")): int(r.get("n") or 0) for r in base_rows}
 
-    prof_by = await _proficiencies_by_student_assessment(
-        db, assessment_ids=assessment_ids, classroom_ids=classroom_ids
+    prof_by = await proficiencies_by_student_assessment(
+        db, assessment_ids=assessment_ids
     )
 
     items: list[dict[str, Any]] = []

@@ -21,16 +21,29 @@ def _sample_bundle() -> dict:
             "systemAverage": 58.0,
         },
         "pedagogicalReading": {"text": "Priorize intervenção em Matemática."},
+        "areaProficiencies": [
+            {
+                "areaSlug": "matematica",
+                "areaName": "Matemática",
+                "proficiency": 187.5,
+                "levelCode": "adequado",
+                "levelLabel": "Adequado",
+            }
+        ],
         "componentPerformance": [
             {
                 "componentName": "Matemática",
                 "areaName": "Matemática",
+                "areaSlug": "matematica",
                 "totalQuestions": 5,
                 "correctAnswers": 3,
                 "studentAccuracy": 60.0,
                 "comparisonAverage": 55.0,
                 "variationPercentagePoints": 5.0,
                 "pedagogicalAction": "orientar",
+                "proficiency": 187.5,
+                "proficiencyLevelCode": "adequado",
+                "proficiencyLevelLabel": "Adequado",
             }
         ],
         "questionGroups": [

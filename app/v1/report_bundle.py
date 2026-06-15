@@ -18,6 +18,7 @@ from app.v1._scope import (
     is_teacher_like,
 )
 from app.v1._sql import fetch_all, fetch_one
+from app.v1.proficiency_report import proficiencies_for_student
 
 logger = logging.getLogger(__name__)
 
@@ -640,6 +641,19 @@ async def assessment_pedagogical_report_bundle(
             return str(area_name_by_slug[str(slug)])
         return fallback
 
+    area_proficiencies: list[dict[str, Any]] = []
+    prof_by_area_slug: dict[str, dict[str, Any]] = {}
+    if student_id is not None:
+        area_proficiencies = await proficiencies_for_student(
+            db,
+            student_id=str(student_id),
+            assessment_id=str(assessment_id),
+        )
+        for p in area_proficiencies:
+            slug = str(p.get("areaSlug") or "")
+            if slug:
+                prof_by_area_slug[slug] = p
+
     component_performance: list[dict[str, Any]] = []
     student_total_q = 0
     student_correct = 0
@@ -658,19 +672,28 @@ async def assessment_pedagogical_report_bundle(
         student_total_q += tq
         student_correct += ca
         variation = round(student_accuracy - comparison_avg, 1)
-        component_performance.append(
-            {
-                "componentId": str(r.get("discipline_slug") or name),
-                "componentName": name,
-                "areaName": _area_name(r.get("area_slug"), name),
-                "totalQuestions": tq,
-                "correctAnswers": ca,
-                "studentAccuracy": round(student_accuracy, 1),
-                "comparisonAverage": round(comparison_avg, 1),
-                "variationPercentagePoints": variation,
-                "pedagogicalAction": _pedagogical_action(variation),
-            }
-        )
+        area_slug = str(r.get("area_slug") or "")
+        prof = prof_by_area_slug.get(area_slug) if area_slug else None
+        comp_item: dict[str, Any] = {
+            "componentId": str(r.get("discipline_slug") or name),
+            "componentName": name,
+            "areaName": _area_name(r.get("area_slug"), name),
+            "areaSlug": area_slug or None,
+            "totalQuestions": tq,
+            "correctAnswers": ca,
+            "studentAccuracy": round(student_accuracy, 1),
+            "comparisonAverage": round(comparison_avg, 1),
+            "variationPercentagePoints": variation,
+            "pedagogicalAction": _pedagogical_action(variation),
+        }
+        if prof:
+            if prof.get("proficiency") is not None:
+                comp_item["proficiency"] = prof.get("proficiency")
+            if prof.get("levelCode"):
+                comp_item["proficiencyLevelCode"] = prof.get("levelCode")
+            if prof.get("levelLabel"):
+                comp_item["proficiencyLevelLabel"] = prof.get("levelLabel")
+        component_performance.append(comp_item)
 
     if student_id is not None:
         summary_total = student_total_q or total_q
@@ -913,6 +936,7 @@ async def assessment_pedagogical_report_bundle(
             "school": head.get("school_name"),
         },
         "student": student_block,
+        "areaProficiencies": area_proficiencies,
         "summary": summary,
         "componentPerformance": component_performance,
         "pedagogicalReading": pedagogical_reading,

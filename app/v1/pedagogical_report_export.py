@@ -14,6 +14,101 @@ _ACTION_LABEL = {
     "desafiar": "Desafio",
 }
 
+_AREA_SHORT = {
+    "linguagens": "LP",
+    "matematica": "MAT",
+    "ciencias-natureza": "CN",
+    "ciencias-humanas": "CH",
+}
+
+
+def _area_short_label(area_slug: Any, area_name: Any = None) -> str:
+    slug = str(area_slug or "")
+    if slug in _AREA_SHORT:
+        return _AREA_SHORT[slug]
+    name = str(area_name or "")
+    if len(name) <= 4 and name:
+        return name.upper()
+    return slug[:3].upper() if slug else "—"
+
+
+def _fmt_proficiency(value: Any, level_label: Any = None) -> str:
+    if value is None:
+        return "—"
+    try:
+        score = f"{float(value):.0f}"
+    except (TypeError, ValueError):
+        return str(value)
+    level = str(level_label or "").strip()
+    if level:
+        return f"{score} ({level})"
+    return score
+
+
+def _table_style_header() -> list[tuple]:
+    from reportlab.lib import colors
+
+    return [
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#e8eaf6")),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+    ]
+
+
+def _append_proficiency_summary_pdf(story: list[Any], doc: Any, area_proficiencies: list[dict[str, Any]], section_style: Any) -> None:
+    """Bloco de proficiência por área (resumo individual)."""
+    from reportlab.lib import colors
+    from reportlab.platypus import Paragraph, Spacer, Table, TableStyle
+
+    if not area_proficiencies:
+        return
+    story.append(Spacer(1, 0.25 * 12))
+    story.append(Paragraph("Proficiência por área", section_style))
+    prof_rows = [["Área", "Score TRI", "Nível"]]
+    for p in area_proficiencies:
+        prof_rows.append(
+            [
+                _area_short_label(p.get("areaSlug"), p.get("areaName")),
+                _fmt_proficiency(p.get("proficiency")),
+                str(p.get("levelLabel") or p.get("levelCode") or "—"),
+            ]
+        )
+    prof_table = Table(
+        prof_rows,
+        colWidths=[doc.width * 0.2, doc.width * 0.25, doc.width * 0.55],
+    )
+    style = _table_style_header() + [
+        ("FONTSIZE", (0, 0), (-1, -1), 8),
+        ("LEFTPADDING", (0, 0), (-1, -1), 6),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+        ("TOPPADDING", (0, 0), (-1, -1), 4),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+    ]
+    prof_table.setStyle(TableStyle(style))
+    story.append(prof_table)
+
+
+def _append_proficiency_summary_xlsx(ws: Any, row: int, area_proficiencies: list[dict[str, Any]], bold: Any) -> int:
+    """Seção de proficiência na aba Resumo do Excel."""
+    if not area_proficiencies:
+        return row
+    row += 1
+    ws.cell(row=row, column=1, value="Proficiência por área").font = bold
+    row += 1
+    headers = ["Sigla", "Área", "Score TRI", "Código nível", "Nível"]
+    for col, header in enumerate(headers, start=1):
+        ws.cell(row=row, column=col, value=header).font = bold
+    row += 1
+    for p in area_proficiencies:
+        ws.cell(row=row, column=1, value=_area_short_label(p.get("areaSlug"), p.get("areaName")))
+        ws.cell(row=row, column=2, value=p.get("areaName"))
+        ws.cell(row=row, column=3, value=p.get("proficiency"))
+        ws.cell(row=row, column=4, value=p.get("levelCode"))
+        ws.cell(row=row, column=5, value=p.get("levelLabel"))
+        row += 1
+    return row
+
 
 def _strip_html(value: Any) -> str:
     if not value:
@@ -67,6 +162,7 @@ def build_pedagogical_report_pdf_bytes(bundle: dict[str, Any]) -> bytes:
     student = bundle.get("student") or {}
     summary = bundle.get("summary") or {}
     reading = bundle.get("pedagogicalReading") or {}
+    area_proficiencies = list(bundle.get("areaProficiencies") or [])
     components = list(bundle.get("componentPerformance") or [])
     groups = list(bundle.get("questionGroups") or [])
 
@@ -149,6 +245,8 @@ def build_pedagogical_report_pdf_bytes(bundle: dict[str, Any]) -> bytes:
     )
     story.append(summary_table)
 
+    _append_proficiency_summary_pdf(story, doc, area_proficiencies, section_style)
+
     reading_text = str(reading.get("text") or "—")
     story.append(Paragraph("Leitura pedagógica", section_style))
     story.append(Paragraph(reading_text, body_style))
@@ -158,11 +256,13 @@ def build_pedagogical_report_pdf_bytes(bundle: dict[str, Any]) -> bytes:
         comp_rows = [
             [
                 "Componente",
+                "Área",
                 "Questões",
                 "Acertos",
-                "Acerto aluno",
+                "Acerto",
+                "Proficiência",
                 "Média ref.",
-                "Variação (p.p.)",
+                "Var. (p.p.)",
                 "Ação",
             ]
         ]
@@ -170,24 +270,35 @@ def build_pedagogical_report_pdf_bytes(bundle: dict[str, Any]) -> bytes:
             comp_rows.append(
                 [
                     str(c.get("componentName") or "—"),
+                    _area_short_label(c.get("areaSlug"), c.get("areaName")),
                     str(c.get("totalQuestions") or "—"),
                     str(c.get("correctAnswers") or "—"),
                     _fmt_pct(c.get("studentAccuracy")),
+                    _fmt_proficiency(c.get("proficiency"), c.get("proficiencyLevelLabel")),
                     _fmt_pct(c.get("comparisonAverage")),
-                    str(c.get("variationPercentagePoints") if c.get("variationPercentagePoints") is not None else "—"),
-                    _ACTION_LABEL.get(str(c.get("pedagogicalAction") or ""), str(c.get("pedagogicalAction") or "—")),
+                    str(
+                        c.get("variationPercentagePoints")
+                        if c.get("variationPercentagePoints") is not None
+                        else "—"
+                    ),
+                    _ACTION_LABEL.get(
+                        str(c.get("pedagogicalAction") or ""),
+                        str(c.get("pedagogicalAction") or "—"),
+                    ),
                 ]
             )
         comp_table = Table(
             comp_rows,
             colWidths=[
-                doc.width * 0.22,
+                doc.width * 0.18,
+                doc.width * 0.06,
+                doc.width * 0.07,
+                doc.width * 0.07,
+                doc.width * 0.09,
+                doc.width * 0.14,
+                doc.width * 0.09,
                 doc.width * 0.08,
-                doc.width * 0.08,
-                doc.width * 0.12,
-                doc.width * 0.12,
-                doc.width * 0.12,
-                doc.width * 0.12,
+                doc.width * 0.10,
             ],
             repeatRows=1,
         )
@@ -289,6 +400,7 @@ def build_pedagogical_report_xlsx_bytes(bundle: dict[str, Any]) -> bytes:
     student = bundle.get("student") or {}
     summary = bundle.get("summary") or {}
     reading = bundle.get("pedagogicalReading") or {}
+    area_proficiencies = list(bundle.get("areaProficiencies") or [])
     components = list(bundle.get("componentPerformance") or [])
     groups = list(bundle.get("questionGroups") or [])
 
@@ -320,6 +432,8 @@ def build_pedagogical_report_xlsx_bytes(bundle: dict[str, Any]) -> bytes:
         ws_resumo.cell(row=row, column=2, value=value if value is not None else "")
         row += 1
 
+    row = _append_proficiency_summary_xlsx(ws_resumo, row, area_proficiencies, bold)
+
     row += 1
     comp_headers = [
         "Componente",
@@ -327,6 +441,8 @@ def build_pedagogical_report_xlsx_bytes(bundle: dict[str, Any]) -> bytes:
         "Questões",
         "Acertos",
         "Acerto aluno (%)",
+        "Proficiência (TRI)",
+        "Nível proficiência",
         "Média referência (%)",
         "Variação (p.p.)",
         "Ação pedagógica",
@@ -341,11 +457,13 @@ def build_pedagogical_report_xlsx_bytes(bundle: dict[str, Any]) -> bytes:
         ws_resumo.cell(row=row, column=3, value=c.get("totalQuestions"))
         ws_resumo.cell(row=row, column=4, value=c.get("correctAnswers"))
         ws_resumo.cell(row=row, column=5, value=c.get("studentAccuracy"))
-        ws_resumo.cell(row=row, column=6, value=c.get("comparisonAverage"))
-        ws_resumo.cell(row=row, column=7, value=c.get("variationPercentagePoints"))
+        ws_resumo.cell(row=row, column=6, value=c.get("proficiency"))
+        ws_resumo.cell(row=row, column=7, value=c.get("proficiencyLevelLabel") or c.get("proficiencyLevelCode"))
+        ws_resumo.cell(row=row, column=8, value=c.get("comparisonAverage"))
+        ws_resumo.cell(row=row, column=9, value=c.get("variationPercentagePoints"))
         ws_resumo.cell(
             row=row,
-            column=8,
+            column=10,
             value=_ACTION_LABEL.get(str(c.get("pedagogicalAction") or ""), c.get("pedagogicalAction")),
         )
         row += 1
