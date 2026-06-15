@@ -32,6 +32,11 @@ from app.v1.macro_report import (
     resolve_macro_scope,
     resolve_macro_scope_school,
 )
+from app.v1.pedagogical_report_export import (
+    build_pedagogical_report_pdf_bytes,
+    build_pedagogical_report_xlsx_bytes,
+    pedagogical_export_filename,
+)
 from app.v1.report_bundle import (
     assert_actor_can_read_classroom,
     assert_can_access_assessment_report_student,
@@ -874,6 +879,100 @@ async def report_assessment_pedagogical_v1(
         classroom_id=classroom_id,
         academic_year_id=classroom_ay,
         student_id=student_id,
+    )
+
+
+async def _load_individual_pedagogical_bundle(
+    db: AsyncSession,
+    ctx: AuthContext,
+    *,
+    assessment_id: UUID,
+    classroom_id: UUID,
+    student_id: UUID,
+    academic_year_id: UUID | None,
+) -> dict[str, Any]:
+    """Bundle pedagógico individual com as mesmas regras de escopo do JSON."""
+    c_row = await load_classroom_row_by_id(db, classroom_id)
+    if not c_row:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Turma não encontrada")
+    classroom_ay = UUID(str(c_row["academic_year_id"]))
+    if academic_year_id is not None and str(academic_year_id) != str(classroom_ay):
+        logger.warning(
+            "[v1/reports/pedagogical/export] academic_year_id=%s difere da turma %s — usando %s",
+            academic_year_id,
+            classroom_id,
+            classroom_ay,
+        )
+    await assert_actor_can_read_classroom(db, ctx, classroom_id)
+    await assert_can_access_assessment_report_student(
+        db, ctx, student_id=student_id, assessment_id=assessment_id
+    )
+    bundle = await assessment_pedagogical_report_bundle(
+        db,
+        assessment_id=assessment_id,
+        classroom_id=classroom_id,
+        academic_year_id=classroom_ay,
+        student_id=student_id,
+    )
+    if not bundle.get("student"):
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "Exportação disponível apenas para relatório individual (student_id obrigatório).",
+        )
+    return bundle
+
+
+@router.get("/reports/assessments/{assessment_id}/pedagogical/pdf")
+async def report_assessment_pedagogical_pdf_v1(
+    assessment_id: UUID,
+    ctx: Annotated[AuthContext, Depends(get_auth_context)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+    classroom_id: UUID = Query(..., description="Turma do relatório (obrigatório)."),
+    student_id: UUID = Query(..., description="Aluno (obrigatório para exportação individual)."),
+    academic_year_id: UUID | None = Query(None, description="Ano letivo. Se omitido, usa o da turma."),
+):
+    """PDF gerado no servidor a partir do relatório pedagógico individual."""
+    bundle = await _load_individual_pedagogical_bundle(
+        db,
+        ctx,
+        assessment_id=assessment_id,
+        classroom_id=classroom_id,
+        student_id=student_id,
+        academic_year_id=academic_year_id,
+    )
+    pdf_bytes = build_pedagogical_report_pdf_bytes(bundle)
+    fname = pedagogical_export_filename(bundle, "pdf")
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+    )
+
+
+@router.get("/reports/assessments/{assessment_id}/pedagogical/export.xlsx")
+async def report_assessment_pedagogical_xlsx_v1(
+    assessment_id: UUID,
+    ctx: Annotated[AuthContext, Depends(get_auth_context)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+    classroom_id: UUID = Query(..., description="Turma do relatório (obrigatório)."),
+    student_id: UUID = Query(..., description="Aluno (obrigatório para exportação individual)."),
+    academic_year_id: UUID | None = Query(None, description="Ano letivo. Se omitido, usa o da turma."),
+):
+    """Planilha Excel com resumo e questões (dados brutos) do relatório individual."""
+    bundle = await _load_individual_pedagogical_bundle(
+        db,
+        ctx,
+        assessment_id=assessment_id,
+        classroom_id=classroom_id,
+        student_id=student_id,
+        academic_year_id=academic_year_id,
+    )
+    xlsx_bytes = build_pedagogical_report_xlsx_bytes(bundle)
+    fname = pedagogical_export_filename(bundle, "xlsx")
+    return Response(
+        content=xlsx_bytes,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'},
     )
 
 
