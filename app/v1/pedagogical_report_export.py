@@ -231,9 +231,7 @@ def build_pedagogical_report_pdf_bytes(bundle: dict[str, Any]) -> bytes:
                 ]
             ]
             for q in group.get("questions") or []:
-                skill = q.get("skillCode") or ""
-                if q.get("skillDescription"):
-                    skill = f"{skill} — {q.get('skillDescription')}" if skill else str(q.get("skillDescription"))
+                skill = str(q.get("skillCode") or "—")
                 q_rows.append(
                     [
                         str(q.get("questionNumber") or "—"),
@@ -249,11 +247,11 @@ def build_pedagogical_report_pdf_bytes(bundle: dict[str, Any]) -> bytes:
                 q_rows,
                 colWidths=[
                     doc.width * 0.06,
-                    doc.width * 0.28,
+                    doc.width * 0.14,
                     doc.width * 0.08,
                     doc.width * 0.08,
-                    doc.width * 0.12,
-                    doc.width * 0.12,
+                    doc.width * 0.14,
+                    doc.width * 0.14,
                     doc.width * 0.08,
                 ],
                 repeatRows=1,
