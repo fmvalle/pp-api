@@ -29,10 +29,15 @@ async def _proficiencies_by_student_assessment(
     db: AsyncSession,
     *,
     assessment_ids: list[str],
-    classroom_ids: list[str],
+    classroom_ids: list[str] | None = None,
 ) -> dict[tuple[str, str], list[dict[str, Any]]]:
-    """Proficiências por (student_id, assessment_id), agrupadas por área."""
-    if not assessment_ids or not classroom_ids:
+    """Proficiências por (student_id, assessment_id), agrupadas por área.
+
+    O vínculo único no banco é (student_id, assessment_id, area_slug); ``classroom_id``
+    na tabela é contexto e não entra na chave de exibição — filtrar só por turma costuma
+    ocultar linhas inseridas manualmente com classroom_id divergente.
+    """
+    if not assessment_ids:
         return {}
     try:
         rows = await fetch_all(
@@ -41,24 +46,30 @@ async def _proficiencies_by_student_assessment(
             SELECT sap.student_id,
                    sap.assessment_id,
                    sap.area_slug,
-                   ca.name AS area_name,
+                   COALESCE(ca.name, sap.area_slug) AS area_name,
                    sap.proficiency,
                    sap.level_code,
                    pl.label AS level_label
             FROM student_assessment_area_proficiency sap
-            JOIN curricular_areas ca ON ca.slug = sap.area_slug
+            LEFT JOIN curricular_areas ca ON ca.slug = sap.area_slug
             LEFT JOIN proficiency_levels pl ON pl.code = sap.level_code
             WHERE sap.assessment_id = ANY(CAST(:aids AS uuid[]))
-              AND sap.classroom_id = ANY(CAST(:cids AS uuid[]))
-            ORDER BY ca.name
+            ORDER BY sap.area_slug
             """,
-            {"aids": assessment_ids, "cids": classroom_ids},
+            {"aids": assessment_ids},
         )
     except Exception as exc:
         if _proficiency_table_missing(exc):
             logger.debug("student_assessment_area_proficiency ausente; proficiências omitidas")
             return {}
         raise
+
+    if not rows:
+        logger.info(
+            "[macro_report] nenhuma proficiência para assessment_ids=%s (classroom_ids=%s ignorados no filtro)",
+            len(assessment_ids),
+            len(classroom_ids or []),
+        )
 
     out: dict[tuple[str, str], list[dict[str, Any]]] = {}
     for r in rows:
