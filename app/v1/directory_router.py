@@ -59,6 +59,42 @@ def _normalize_role_filter_param(role: str | None) -> str | None:
     return r
 
 
+_USERS_LIST_FROM = """
+SELECT vp.*, s.name AS school_name
+FROM vw_profiles vp
+LEFT JOIN schools s ON s.id = vp.school_id
+"""
+
+
+def _apply_users_list_filters(
+    sql: str,
+    params: dict[str, Any],
+    *,
+    role_filter: str | None,
+    q: str | None,
+) -> tuple[str, dict[str, Any]]:
+    if role_filter is not None:
+        sql += " AND vp.role = CAST(:role_filter AS user_role)"
+        params["role_filter"] = role_filter
+    if q and q.strip():
+        sql += " AND (vp.full_name ILIKE :qpat OR vp.email ILIKE :qpat)"
+        params["qpat"] = f"%{q.strip()}%"
+    return sql, params
+
+
+async def _assert_school_id_in_scope(
+    db: AsyncSession,
+    ctx: AuthContext,
+    school_id: UUID,
+) -> None:
+    if is_admin_like(ctx.role):
+        return
+    sscope = await get_effective_school_scope(db, ctx)
+    eff = {str(x) for x in (sscope.get("effective_school_ids") or [])}
+    if str(school_id) not in eff:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Escola fora do escopo")
+
+
 async def _student_scope_read(db: AsyncSession, ctx: AuthContext, student_id: UUID) -> dict[str, Any]:
     row = await fetch_one(db, "SELECT * FROM vw_profiles WHERE id = CAST(:id AS uuid)", {"id": str(student_id)})
     if not row:
@@ -221,44 +257,48 @@ async def list_users_v1(
         None,
         description="Filtrar por papel (STUDENT, TEACHER, SCHOOL_ADMIN, PLATFORM_ADMIN)",
     ),
+    q: str | None = Query(None, description="Busca por nome ou e-mail"),
     pg: Annotated[PageArgs, Depends(pagination_params)] = PageArgs(1, 50),
 ):
     """Lista consolidada via vw_profiles (admin: opcional school_id e role; demais: escopo escola/self)."""
     role_filter = _normalize_role_filter_param(role)
-    sscope = await get_effective_school_scope(db, ctx)
     if is_admin_like(ctx.role):
-        sql = "SELECT * FROM vw_profiles WHERE 1=1"
+        sql = f"{_USERS_LIST_FROM} WHERE 1=1"
         params: dict[str, Any] = {}
         if school_id:
-            subtree = await get_descendant_school_ids(db, school_id)
-            sql += " AND school_id = ANY(CAST(:subtree AS uuid[]))"
-            params["subtree"] = [str(x) for x in subtree]
-        if role_filter is not None:
-            sql += " AND role = CAST(:role_filter AS user_role)"
-            params["role_filter"] = role_filter
+            sql += " AND vp.school_id = CAST(:school_id AS uuid)"
+            params["school_id"] = str(school_id)
+        sql, params = _apply_users_list_filters(sql, params, role_filter=role_filter, q=q)
         count_row = await fetch_one(db, f"SELECT COUNT(*)::int AS total FROM ({sql}) q", params)
         items = await fetch_all(
             db,
-            f"{sql} ORDER BY created_at NULLS LAST LIMIT {pg.per_page} OFFSET {pg.offset}",
+            f"{sql} ORDER BY vp.created_at NULLS LAST LIMIT {pg.per_page} OFFSET {pg.offset}",
             params,
         )
         return paged_response(page=pg.page, per_page=pg.per_page, total=(count_row or {}).get("total", 0), items=items)
-    sql = "SELECT * FROM vw_profiles WHERE 1=1"
-    params: dict[str, Any] = {}
-    if sscope["effective_school_ids"]:
-        sql += " AND (school_id = ANY(CAST(:sids AS uuid[])) OR person_id = CAST(:pid AS uuid))"
-        params["sids"] = [str(x) for x in sscope["effective_school_ids"]]
-        params["pid"] = str(ctx.person_id)
+
+    sql = f"{_USERS_LIST_FROM} WHERE 1=1"
+    params = {}
+    if school_id:
+        await _assert_school_id_in_scope(db, ctx, school_id)
+        sql += " AND vp.school_id = CAST(:school_id AS uuid)"
+        params["school_id"] = str(school_id)
+    elif sscope := await get_effective_school_scope(db, ctx):
+        if sscope["effective_school_ids"]:
+            sql += " AND (vp.school_id = ANY(CAST(:sids AS uuid[])) OR vp.person_id = CAST(:pid AS uuid))"
+            params["sids"] = [str(x) for x in sscope["effective_school_ids"]]
+            params["pid"] = str(ctx.person_id)
+        else:
+            sql += " AND vp.person_id = CAST(:pid AS uuid)"
+            params["pid"] = str(ctx.person_id)
     else:
-        sql += " AND person_id = CAST(:pid AS uuid)"
+        sql += " AND vp.person_id = CAST(:pid AS uuid)"
         params["pid"] = str(ctx.person_id)
-    if role_filter is not None:
-        sql += " AND role = CAST(:role_filter AS user_role)"
-        params["role_filter"] = role_filter
+    sql, params = _apply_users_list_filters(sql, params, role_filter=role_filter, q=q)
     count_row = await fetch_one(db, f"SELECT COUNT(*)::int AS total FROM ({sql}) q", params)
     items = await fetch_all(
         db,
-        f"{sql} ORDER BY created_at NULLS LAST LIMIT {pg.per_page} OFFSET {pg.offset}",
+        f"{sql} ORDER BY vp.created_at NULLS LAST LIMIT {pg.per_page} OFFSET {pg.offset}",
         params,
     )
     return paged_response(page=pg.page, per_page=pg.per_page, total=(count_row or {}).get("total", 0), items=items)
