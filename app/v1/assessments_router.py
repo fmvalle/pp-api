@@ -82,7 +82,9 @@ def _shape_assessment_schedule_list_item(row: dict[str, Any]) -> dict[str, Any]:
     ccode = r.pop("_classroom_code", None)
     gname = r.pop("_grade_name", None)
     ayear = r.pop("_academic_year_year", None)
+    atitle = r.pop("_assessment_title", None)
     cid = r.get("classroom_id")
+    aid = r.get("assessment_id")
     r["classrooms"] = {
         "id": str(cid) if cid is not None else None,
         "name": cname,
@@ -90,6 +92,11 @@ def _shape_assessment_schedule_list_item(row: dict[str, Any]) -> dict[str, Any]:
         "grades": ({"name": gname} if gname is not None else None),
         "academic_years": ({"year": ayear} if ayear is not None else None),
     }
+    if atitle is not None or aid is not None:
+        r["assessments"] = {
+            "id": str(aid) if aid is not None else None,
+            "title": atitle,
+        }
     return r
 
 
@@ -128,6 +135,7 @@ class AssessmentPatch(BaseModel):
     title: str | None = None
     description: str | None = None
     assessment_type: str | None = Field(default=None, alias="type")
+    macro_assessment_id: UUID | None = None
 
     model_config = {"populate_by_name": True}
 
@@ -242,6 +250,9 @@ async def patch_assessment_v1(
     if body.assessment_type is not None:
         sets.append("type = :typ")
         params["typ"] = body.assessment_type
+    if body.macro_assessment_id is not None:
+        sets.append("macro_assessment_id = CAST(:mid AS uuid)")
+        params["mid"] = str(body.macro_assessment_id)
     if not sets:
         return await get_assessment_v1(assessment_id, ctx, db)
     sql = f"UPDATE assessments SET {', '.join(sets)} WHERE id = CAST(:id AS uuid) RETURNING *"
@@ -257,7 +268,7 @@ async def delete_assessment_v1(
     db: Annotated[AsyncSession, Depends(get_db)],
 ):
     await get_assessment_v1(assessment_id, ctx, db)
-    if not is_admin_like(ctx.role) and _norm_role(ctx.role) != "platform_admin":
+    if not is_admin_like(ctx.role):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Apenas administradores")
     await execute(db, "DELETE FROM assessments WHERE id = CAST(:id AS uuid)", {"id": str(assessment_id)})
     await db.commit()
@@ -555,11 +566,13 @@ SELECT
   ass.end_time,
   ass.created_at,
   ass.school_id,
+  a.title AS _assessment_title,
   c."name" AS _classroom_name,
   c.code AS _classroom_code,
   g."name" AS _grade_name,
   ay."year" AS _academic_year_year
 FROM assessment_schedules ass
+JOIN assessments a ON a.id = ass.assessment_id
 JOIN classrooms c ON c.id = ass.classroom_id
 JOIN grades g ON g.id = c.grade_id
 JOIN academic_years ay ON ay.id = c.academic_year_id
@@ -742,8 +755,9 @@ async def get_schedule_v1(
     row = await fetch_one(
         db,
         """
-        SELECT ass.*
+        SELECT ass.*, a.title AS _assessment_title
         FROM assessment_schedules ass
+        JOIN assessments a ON a.id = ass.assessment_id
         JOIN classrooms c ON c.id = ass.classroom_id
         WHERE ass.id = CAST(:id AS uuid)
           AND c.academic_year_id = CAST(:ay AS uuid)
@@ -1534,3 +1548,156 @@ async def download_schedule_attendance_sheet_pdf_v1(
         media_type="application/pdf",
         headers={"Content-Disposition": f'attachment; filename="{fname}"'},
     )
+
+
+class MacroAssessmentCreate(BaseModel):
+    title: str
+    description: str | None = None
+    start_date: datetime | None = None
+    end_date: datetime | None = None
+
+
+class MacroAssessmentPatch(BaseModel):
+    title: str | None = None
+    description: str | None = None
+    start_date: datetime | None = None
+    end_date: datetime | None = None
+
+
+def _assert_platform_catalog_admin(ctx: AuthContext) -> None:
+    if not is_admin_like(ctx.role):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Apenas administradores da plataforma")
+
+
+@router.get("/macro-assessments")
+async def list_macro_assessments_admin_v1(
+    ctx: Annotated[AuthContext, Depends(get_auth_context)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+    pg: Annotated[PageArgs, Depends(pagination_params)] = PageArgs(1, 50),
+):
+    """Lista macro avaliações para gestão administrativa."""
+    _assert_platform_catalog_admin(ctx)
+    count_row = await fetch_one(db, "SELECT COUNT(*)::int AS total FROM macro_assessments", {})
+    items = await fetch_all(
+        db,
+        f"""
+        SELECT ma.*,
+               (SELECT COUNT(*)::int FROM assessments a WHERE a.macro_assessment_id = ma.id) AS caderno_count
+        FROM macro_assessments ma
+        ORDER BY ma.created_at DESC NULLS LAST
+        LIMIT {pg.per_page} OFFSET {pg.offset}
+        """,
+        {},
+    )
+    return paged_response(page=pg.page, per_page=pg.per_page, total=(count_row or {}).get("total", 0), items=items)
+
+
+@router.post("/macro-assessments")
+async def create_macro_assessment_admin_v1(
+    body: MacroAssessmentCreate,
+    ctx: Annotated[AuthContext, Depends(get_auth_context)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+):
+    _assert_platform_catalog_admin(ctx)
+    row = await fetch_one(
+        db,
+        """
+        INSERT INTO macro_assessments (title, description, start_date, end_date)
+        VALUES (:title, :description, :start_date, :end_date)
+        RETURNING *
+        """,
+        {
+            "title": body.title,
+            "description": body.description,
+            "start_date": body.start_date,
+            "end_date": body.end_date,
+        },
+    )
+    await db.commit()
+    return row
+
+
+@router.get("/macro-assessments/{macro_id}")
+async def get_macro_assessment_admin_v1(
+    macro_id: UUID,
+    ctx: Annotated[AuthContext, Depends(get_auth_context)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+):
+    _assert_platform_catalog_admin(ctx)
+    row = await fetch_one(
+        db,
+        "SELECT * FROM macro_assessments WHERE id = CAST(:id AS uuid)",
+        {"id": str(macro_id)},
+    )
+    if not row:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Macro avaliação não encontrada")
+    cadernos = await fetch_all(
+        db,
+        """
+        SELECT id, title, type, school_id
+        FROM assessments
+        WHERE macro_assessment_id = CAST(:mid AS uuid)
+        ORDER BY title
+        """,
+        {"mid": str(macro_id)},
+    )
+    return {"macro": row, "cadernos": cadernos}
+
+
+@router.patch("/macro-assessments/{macro_id}")
+async def patch_macro_assessment_admin_v1(
+    macro_id: UUID,
+    body: MacroAssessmentPatch,
+    ctx: Annotated[AuthContext, Depends(get_auth_context)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+):
+    _assert_platform_catalog_admin(ctx)
+    row = await fetch_one(
+        db,
+        "SELECT id FROM macro_assessments WHERE id = CAST(:id AS uuid)",
+        {"id": str(macro_id)},
+    )
+    if not row:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Macro avaliação não encontrada")
+    sets = []
+    params: dict[str, Any] = {"id": str(macro_id)}
+    if body.title is not None:
+        sets.append("title = :title")
+        params["title"] = body.title
+    if body.description is not None:
+        sets.append("description = :description")
+        params["description"] = body.description
+    if body.start_date is not None:
+        sets.append("start_date = :start_date")
+        params["start_date"] = body.start_date
+    if body.end_date is not None:
+        sets.append("end_date = :end_date")
+        params["end_date"] = body.end_date
+    if not sets:
+        return await get_macro_assessment_admin_v1(macro_id, ctx, db)
+    sql = f"UPDATE macro_assessments SET {', '.join(sets)} WHERE id = CAST(:id AS uuid) RETURNING *"
+    out = await fetch_one(db, sql, params)
+    await db.commit()
+    return out
+
+
+@router.delete("/macro-assessments/{macro_id}")
+async def delete_macro_assessment_admin_v1(
+    macro_id: UUID,
+    ctx: Annotated[AuthContext, Depends(get_auth_context)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+):
+    _assert_platform_catalog_admin(ctx)
+    linked = await fetch_one(
+        db,
+        "SELECT id FROM assessments WHERE macro_assessment_id = CAST(:id AS uuid) LIMIT 1",
+        {"id": str(macro_id)},
+    )
+    if linked:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "Macro possui cadernos vinculados; desvincule ou remova os cadernos antes.",
+        )
+    await execute(db, "DELETE FROM macro_assessments WHERE id = CAST(:id AS uuid)", {"id": str(macro_id)})
+    await db.commit()
+    return {"ok": True}

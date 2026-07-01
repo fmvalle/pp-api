@@ -11,6 +11,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
+from app.core.deps import AuthContext, get_auth_context
 from app.core.firebase import firebase_credential_diagnostic
 from app.db.session import get_db
 from app.domains.auth.router import router as auth_router
@@ -18,6 +19,7 @@ from app.domains.me.router import router as me_router
 from app.v1.auth.schemas import FirebaseExchangeResponseV1, SignInRequestV1
 from app.v1.auth.service import firebase_sign_in_with_password_v1
 from app.v1.router import router as v1_router
+from app.v1.chat_router import ChatRequest, chat_v1
 
 
 @asynccontextmanager
@@ -116,6 +118,25 @@ async def post_api_v1_auth_sign_in(
 
 
 app.include_router(_api_v1_auth_compat)
+
+_api_chat_compat = APIRouter(prefix="/api", tags=["v1-chat"])
+
+
+@_api_chat_compat.post(
+    "/chat",
+    summary="[Alias] Chat híbrido Avaliador",
+    description="Mesmo comportamento que `POST /v1/chat`.",
+    include_in_schema=True,
+)
+async def post_api_chat(
+    body: ChatRequest,
+    ctx: Annotated[AuthContext, Depends(get_auth_context)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+):
+    return await chat_v1(body, ctx, db)
+
+
+app.include_router(_api_chat_compat)
 
 
 @app.get(

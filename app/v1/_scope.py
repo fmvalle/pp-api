@@ -17,8 +17,14 @@ from app.v1._sql import fetch_all
 
 
 def is_admin_like(role: str) -> bool:
-    r = (role or "").lower()
-    return r in ("admin", "administrator", "super_admin", "coordenador_master")
+    r = _norm_role(role)
+    return r in (
+        "admin",
+        "administrator",
+        "super_admin",
+        "coordenador_master",
+        "platform_admin",
+    )
 
 
 def _norm_role(role: str) -> str:
@@ -73,6 +79,25 @@ async def resolve_admin_dashboard_school_ids(
 def is_teacher_like(role: str) -> bool:
     r = (role or "").lower()
     return "teacher" in r or "prof" in r
+
+
+def resolve_bot_audience(role: str) -> str:
+    """Papel normalizado para filtro de intenções do Avaliador."""
+    r = _norm_role(role)
+    if is_admin_like(role):
+        return "platform_admin"
+    if r == "school_admin":
+        return "school_admin"
+    if "student" in r or r == "aluno":
+        return "student"
+    if is_teacher_like(role):
+        return "teacher"
+    return "teacher"
+
+
+def can_use_assistant(role: str) -> bool:
+    """Professor ou admin de plataforma (incl. platform_admin via is_admin_like)."""
+    return is_teacher_like(role) or is_admin_like(role)
 
 
 def school_filter_sql(ctx: AuthContext, column: str = "school_id") -> tuple[str, dict[str, UUID]]:

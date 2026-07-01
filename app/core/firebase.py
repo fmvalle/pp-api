@@ -1,11 +1,19 @@
 import json
+import logging
 import os
+from pathlib import Path
 from urllib.parse import quote
 
 import firebase_admin
 from firebase_admin import credentials
 
 from app.core.config import settings
+
+logger = logging.getLogger(__name__)
+
+_API_ROOT = Path(__file__).resolve().parent.parent.parent
+_LOCAL_FIREBASE_CREDENTIALS = _API_ROOT / "secrets" / "firebase-admin.json"
+_CLOUD_RUN_FIREBASE_CREDENTIALS = Path("/secrets/firebase-admin.json")
 
 
 def _normalize_firebase_private_key(raw: str) -> str:
@@ -55,6 +63,36 @@ def _service_account_dict_from_env_fields() -> dict | None:
     }
 
 
+def _resolve_firebase_credentials_path(cred_path: str) -> str | None:
+    """Resolve path relativo ao repo da API e faz fallback local em dev."""
+    raw = Path(cred_path)
+    candidates: list[Path] = []
+
+    if raw.is_absolute():
+        candidates.append(raw)
+    else:
+        candidates.extend([Path.cwd() / raw, _API_ROOT / raw])
+
+    if raw == _CLOUD_RUN_FIREBASE_CREDENTIALS or str(raw) == "/secrets/firebase-admin.json":
+        candidates.append(_LOCAL_FIREBASE_CREDENTIALS)
+
+    seen: set[Path] = set()
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        if resolved.is_file():
+            if str(resolved) != cred_path:
+                logger.warning(
+                    "Firebase Admin: credencial resolvida de %s para %s",
+                    cred_path,
+                    resolved,
+                )
+            return str(resolved)
+    return None
+
+
 def ensure_firebase_initialized() -> None:
     """Garante Admin SDK antes de auth.verify_id_token / create_user / etc.
 
@@ -72,12 +110,19 @@ def init_firebase() -> None:
 
     cred_path = (settings.firebase_credentials_path or "").strip()
     if cred_path:
-        with open(cred_path, "r", encoding="utf-8") as f:
-            info = json.load(f)
-        _validate_project_id(info.get("project_id"))
-        cred = credentials.Certificate(info)
-        firebase_admin.initialize_app(cred, opts)
-        return
+        resolved_path = _resolve_firebase_credentials_path(cred_path)
+        if resolved_path:
+            with open(resolved_path, "r", encoding="utf-8") as f:
+                info = json.load(f)
+            _validate_project_id(info.get("project_id"))
+            cred = credentials.Certificate(info)
+            firebase_admin.initialize_app(cred, opts)
+            return
+        logger.warning(
+            "Firebase Admin: FIREBASE_CREDENTIALS_PATH=%s não encontrado; "
+            "tentando outras fontes de credencial.",
+            cred_path,
+        )
 
     cred_json = (settings.firebase_credentials_json or "").strip()
     if cred_json:
@@ -137,9 +182,11 @@ def firebase_credential_diagnostic() -> dict[str, object]:
     }
 
     if path:
+        resolved = _resolve_firebase_credentials_path(path)
         out["credential_branch"] = "FIREBASE_CREDENTIALS_PATH"
         out["path"] = path
-        out["path_is_file"] = os.path.isfile(path)
+        out["resolved_path"] = resolved
+        out["path_is_file"] = resolved is not None
         return out
     if js:
         out["credential_branch"] = "FIREBASE_CREDENTIALS_JSON"

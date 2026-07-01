@@ -32,6 +32,16 @@ def _area_short_label(area_slug: Any, area_name: Any = None) -> str:
     return slug[:3].upper() if slug else "—"
 
 
+def _area_display_name(area_slug: Any, area_name: Any = None, *, max_len: int | None = None) -> str:
+    """Nome completo da área; abrevia só se exceder ``max_len`` (layout compacto)."""
+    name = str(area_name or "").strip()
+    if name:
+        if max_len is not None and len(name) > max_len:
+            return _area_short_label(area_slug, area_name)
+        return name
+    return _area_short_label(area_slug, area_name)
+
+
 def _fmt_proficiency(value: Any, level_label: Any = None) -> str:
     if value is None:
         return "—"
@@ -69,14 +79,14 @@ def _append_proficiency_summary_pdf(story: list[Any], doc: Any, area_proficienci
     for p in area_proficiencies:
         prof_rows.append(
             [
-                _area_short_label(p.get("areaSlug"), p.get("areaName")),
+                _area_display_name(p.get("areaSlug"), p.get("areaName")),
                 _fmt_proficiency(p.get("proficiency")),
                 str(p.get("levelLabel") or p.get("levelCode") or "—"),
             ]
         )
     prof_table = Table(
         prof_rows,
-        colWidths=[doc.width * 0.2, doc.width * 0.25, doc.width * 0.55],
+        colWidths=[doc.width * 0.45, doc.width * 0.2, doc.width * 0.35],
     )
     style = _table_style_header() + [
         ("FONTSIZE", (0, 0), (-1, -1), 8),
@@ -96,16 +106,15 @@ def _append_proficiency_summary_xlsx(ws: Any, row: int, area_proficiencies: list
     row += 1
     ws.cell(row=row, column=1, value="Proficiência por área").font = bold
     row += 1
-    headers = ["Sigla", "Área", "Score TRI", "Código nível", "Nível"]
+    headers = ["Área", "Score TRI", "Código nível", "Nível"]
     for col, header in enumerate(headers, start=1):
         ws.cell(row=row, column=col, value=header).font = bold
     row += 1
     for p in area_proficiencies:
-        ws.cell(row=row, column=1, value=_area_short_label(p.get("areaSlug"), p.get("areaName")))
-        ws.cell(row=row, column=2, value=p.get("areaName"))
-        ws.cell(row=row, column=3, value=p.get("proficiency"))
-        ws.cell(row=row, column=4, value=p.get("levelCode"))
-        ws.cell(row=row, column=5, value=p.get("levelLabel"))
+        ws.cell(row=row, column=1, value=_area_display_name(p.get("areaSlug"), p.get("areaName")))
+        ws.cell(row=row, column=2, value=p.get("proficiency"))
+        ws.cell(row=row, column=3, value=p.get("levelCode"))
+        ws.cell(row=row, column=4, value=p.get("levelLabel"))
         row += 1
     return row
 
@@ -225,7 +234,7 @@ def build_pedagogical_report_pdf_bytes(bundle: dict[str, Any]) -> bytes:
         ["Acerto do aluno", _fmt_pct(summary.get("accuracyPercentage"))],
         ["Média da turma", _fmt_pct(summary.get("classroomAverage"))],
         ["Média da escola", _fmt_pct(summary.get("schoolAverage"))],
-        ["Média geral", _fmt_pct(summary.get("systemAverage"))],
+        ["Média Geral", _fmt_pct(summary.get("systemAverage"))],
     ]
     summary_table = Table(summary_rows, colWidths=[doc.width * 0.55, doc.width * 0.45])
     summary_table.setStyle(
@@ -270,7 +279,7 @@ def build_pedagogical_report_pdf_bytes(bundle: dict[str, Any]) -> bytes:
             comp_rows.append(
                 [
                     str(c.get("componentName") or "—"),
-                    _area_short_label(c.get("areaSlug"), c.get("areaName")),
+                    _area_display_name(c.get("areaSlug"), c.get("areaName"), max_len=14),
                     str(c.get("totalQuestions") or "—"),
                     str(c.get("correctAnswers") or "—"),
                     _fmt_pct(c.get("studentAccuracy")),
@@ -320,7 +329,7 @@ def build_pedagogical_report_pdf_bytes(bundle: dict[str, Any]) -> bytes:
         story.append(comp_table)
 
     if groups:
-        story.append(Paragraph("Questão a questão", section_style))
+        story.append(Paragraph("Questões", section_style))
         for group in groups:
             comp_name = str(group.get("componentName") or "Componente")
             area_name = str(group.get("areaName") or "")
@@ -337,7 +346,7 @@ def build_pedagogical_report_pdf_bytes(bundle: dict[str, Any]) -> bytes:
                     "Gabarito",
                     "Resposta",
                     "Média escola",
-                    "Média geral",
+                    "Média Geral",
                     "Resp.",
                 ]
             ]
@@ -423,7 +432,7 @@ def build_pedagogical_report_xlsx_bytes(bundle: dict[str, Any]) -> bytes:
         ("Acerto do aluno (%)", summary.get("accuracyPercentage")),
         ("Média da turma (%)", summary.get("classroomAverage")),
         ("Média da escola (%)", summary.get("schoolAverage")),
-        ("Média geral (%)", summary.get("systemAverage")),
+        ("Média Geral (%)", summary.get("systemAverage")),
         ("Leitura pedagógica", reading.get("text")),
     ]
     row = 3
@@ -482,9 +491,9 @@ def build_pedagogical_report_xlsx_bytes(bundle: dict[str, Any]) -> bytes:
         "Descrição habilidade",
         "Gabarito",
         "Resposta aluno",
-        "Acertou",
+        "Correta",
         "Média escola (%)",
-        "Média geral (%)",
+        "Média Geral (%)",
         "Respondentes turma",
         "Enunciado",
     ]

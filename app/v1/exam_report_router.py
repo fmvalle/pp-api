@@ -1647,6 +1647,9 @@ async def teacher_dashboard_v1(
     # schedule_id: um agendamento por (assessment_id, classroom_id) — mesma regra que o app usava via PostgREST.
     base_sql = """
     SELECT vas.*,
+        vas.title AS assessment_title,
+        c.name AS classroom_name,
+        g.name AS grade_name,
         (
             SELECT sch.id
             FROM assessment_schedules sch
@@ -1657,6 +1660,7 @@ async def teacher_dashboard_v1(
         ) AS schedule_id
     FROM vw_assessment_summary vas
     JOIN classrooms c ON c.id = vas.classroom_id
+    LEFT JOIN grades g ON g.id = c.grade_id
     WHERE c.academic_year_id = CAST(:ay AS uuid)
     """
     params: dict[str, Any] = {"ay": str(effective_ay)}

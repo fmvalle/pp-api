@@ -1,6 +1,7 @@
-"""Escolas, turmas e filtros (Etapa 3). Escopo mínimo por perfil; árvore via view schools_tree."""
+"""Escolas, turmas e filtros (Etapa 3). Escopo mínimo por perfil; árvore via view schools_hierarchy."""
 
 import logging
+from datetime import date
 from typing import Annotated, Any
 from uuid import UUID
 
@@ -77,7 +78,7 @@ async def list_schools_v1(
 ):
     scope = await get_effective_school_scope(db, ctx)
     if tree:
-        sql = "SELECT * FROM schools_tree WHERE 1=1"
+        sql = "SELECT * FROM schools_hierarchy WHERE 1=1"
         params: dict[str, Any] = {}
         if root_id:
             sql += " AND root_id = CAST(:root_id AS uuid)"
@@ -113,6 +114,7 @@ class SchoolPatch(BaseModel):
     city: str | None = None
     state: str | None = None
     parent: UUID | None = None
+    bot_enabled: bool | None = None
 
 
 @router.get("/schools/scope")
@@ -206,6 +208,9 @@ async def patch_school_v1(
     if body.parent is not None:
         sets.append("parent = CAST(:parent AS uuid)")
         params["parent"] = str(body.parent)
+    if body.bot_enabled is not None:
+        sets.append("bot_enabled = :bot_enabled")
+        params["bot_enabled"] = body.bot_enabled
     if not sets:
         return await get_school_v1(school_id, ctx, db)
     sql = f"UPDATE schools SET {', '.join(sets)} WHERE id = CAST(:id AS uuid) RETURNING *"
@@ -707,9 +712,15 @@ async def list_classroom_assessment_schedules_v1(
     await _fetch_classroom_scoped(db, ctx, classroom_id, academic_year_id)
     params: dict[str, Any] = {"cid": str(classroom_id), "ay": str(effective_ay)}
     sql = """
-        SELECT sch.*
+        SELECT
+          sch.*,
+          a.title AS _assessment_title,
+          c.name AS _classroom_name,
+          g.name AS _grade_name
         FROM assessment_schedules sch
+        INNER JOIN assessments a ON a.id = sch.assessment_id
         INNER JOIN classrooms c ON c.id = sch.classroom_id
+        INNER JOIN grades g ON g.id = c.grade_id
         WHERE sch.classroom_id = CAST(:cid AS uuid)
           AND c.academic_year_id = CAST(:ay AS uuid)
     """
@@ -717,11 +728,30 @@ async def list_classroom_assessment_schedules_v1(
         sql += " AND sch.assessment_id = CAST(:aid AS uuid)"
         params["aid"] = str(assessment_id)
     count_row = await fetch_one(db, f"SELECT COUNT(*)::int AS total FROM ({sql}) q", params)
-    items = await fetch_all(
+    items_raw = await fetch_all(
         db,
         f"{sql} ORDER BY sch.start_time DESC NULLS LAST LIMIT {pg.per_page} OFFSET {pg.offset}",
         params,
     )
+    items = []
+    for raw in items_raw:
+        row = dict(raw)
+        cname = row.pop("_classroom_name", None)
+        gname = row.pop("_grade_name", None)
+        atitle = row.pop("_assessment_title", None)
+        cid = row.get("classroom_id")
+        aid = row.get("assessment_id")
+        row["classrooms"] = {
+            "id": str(cid) if cid is not None else None,
+            "name": cname,
+            "grades": ({"name": gname} if gname is not None else None),
+        }
+        if atitle is not None or aid is not None:
+            row["assessments"] = {
+                "id": str(aid) if aid is not None else None,
+                "title": atitle,
+            }
+        items.append(row)
     return paged_response_with_academic_year(
         academic_year_id=effective_ay,
         page=pg.page,
@@ -800,3 +830,339 @@ async def filters_assessment_type_labels_v1(
         },
         "default_label": "Avaliação",
     }
+
+
+# --- Catálogo pedagógico (CRUD admin) ---
+
+
+async def _clear_other_primary_academic_years(db: AsyncSession, keep_id: UUID | None = None) -> None:
+    sql = "UPDATE academic_years SET is_primary = false WHERE is_primary = true"
+    params: dict[str, Any] = {}
+    if keep_id is not None:
+        sql += " AND id <> CAST(:keep_id AS uuid)"
+        params["keep_id"] = str(keep_id)
+    await execute(db, sql, params)
+
+
+class AcademicYearCreate(BaseModel):
+    year: int = Field(..., ge=2000, le=2100)
+    start_date: date | None = None
+    end_date: date | None = None
+    is_active: bool = True
+    is_primary: bool = False
+
+
+class AcademicYearPatch(BaseModel):
+    year: int | None = Field(None, ge=2000, le=2100)
+    start_date: date | None = None
+    end_date: date | None = None
+    is_active: bool | None = None
+    is_primary: bool | None = None
+
+
+@router.post("/academic-years")
+async def create_academic_year_v1(
+    body: AcademicYearCreate,
+    ctx: Annotated[AuthContext, Depends(get_auth_context)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+):
+    if not is_admin_like(ctx.role):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Apenas administradores")
+    if body.is_primary:
+        await _clear_other_primary_academic_years(db)
+    row = await fetch_one(
+        db,
+        """
+        INSERT INTO academic_years (year, start_date, end_date, is_active, is_primary)
+        VALUES (:year, :start_date, :end_date, :is_active, :is_primary)
+        RETURNING *
+        """,
+        {
+            "year": body.year,
+            "start_date": body.start_date,
+            "end_date": body.end_date,
+            "is_active": body.is_active,
+            "is_primary": body.is_primary,
+        },
+    )
+    await db.commit()
+    return row
+
+
+@router.patch("/academic-years/{academic_year_id}")
+async def patch_academic_year_v1(
+    academic_year_id: UUID,
+    body: AcademicYearPatch,
+    ctx: Annotated[AuthContext, Depends(get_auth_context)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+):
+    if not is_admin_like(ctx.role):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Apenas administradores")
+    existing = await fetch_one(
+        db,
+        "SELECT * FROM academic_years WHERE id = CAST(:id AS uuid)",
+        {"id": str(academic_year_id)},
+    )
+    if not existing:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Ano letivo não encontrado")
+    if body.is_primary:
+        await _clear_other_primary_academic_years(db, keep_id=academic_year_id)
+    sets: list[str] = []
+    params: dict[str, Any] = {"id": str(academic_year_id)}
+    if body.year is not None:
+        sets.append("year = :year")
+        params["year"] = body.year
+    if body.start_date is not None:
+        sets.append("start_date = :start_date")
+        params["start_date"] = body.start_date
+    if body.end_date is not None:
+        sets.append("end_date = :end_date")
+        params["end_date"] = body.end_date
+    if body.is_active is not None:
+        sets.append("is_active = :is_active")
+        params["is_active"] = body.is_active
+    if body.is_primary is not None:
+        sets.append("is_primary = :is_primary")
+        params["is_primary"] = body.is_primary
+    if not sets:
+        return existing
+    row = await fetch_one(
+        db,
+        f"UPDATE academic_years SET {', '.join(sets)} WHERE id = CAST(:id AS uuid) RETURNING *",
+        params,
+    )
+    await db.commit()
+    return row
+
+
+@router.delete("/academic-years/{academic_year_id}")
+async def delete_academic_year_v1(
+    academic_year_id: UUID,
+    ctx: Annotated[AuthContext, Depends(get_auth_context)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+):
+    if not is_admin_like(ctx.role):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Apenas administradores")
+    existing = await fetch_one(
+        db,
+        "SELECT id FROM academic_years WHERE id = CAST(:id AS uuid)",
+        {"id": str(academic_year_id)},
+    )
+    if not existing:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Ano letivo não encontrado")
+    in_use = await fetch_one(
+        db,
+        "SELECT 1 AS x FROM classrooms WHERE academic_year_id = CAST(:id AS uuid) LIMIT 1",
+        {"id": str(academic_year_id)},
+    )
+    if in_use:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "Ano letivo com turmas vinculadas; remova ou mova as turmas antes.",
+        )
+    await execute(db, "DELETE FROM academic_years WHERE id = CAST(:id AS uuid)", {"id": str(academic_year_id)})
+    await db.commit()
+    return {"ok": True}
+
+
+class SegmentCreate(BaseModel):
+    name: str = Field(..., min_length=1, max_length=255)
+
+
+class SegmentPatch(BaseModel):
+    name: str | None = Field(None, min_length=1, max_length=255)
+
+
+@router.post("/segments")
+async def create_segment_v1(
+    body: SegmentCreate,
+    ctx: Annotated[AuthContext, Depends(get_auth_context)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+):
+    if not is_admin_like(ctx.role):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Apenas administradores")
+    row = await fetch_one(
+        db,
+        "INSERT INTO segments (name) VALUES (:name) RETURNING *",
+        {"name": body.name.strip()},
+    )
+    await db.commit()
+    return row
+
+
+@router.patch("/segments/{segment_id}")
+async def patch_segment_v1(
+    segment_id: UUID,
+    body: SegmentPatch,
+    ctx: Annotated[AuthContext, Depends(get_auth_context)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+):
+    if not is_admin_like(ctx.role):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Apenas administradores")
+    if body.name is None:
+        row = await fetch_one(
+            db,
+            "SELECT * FROM segments WHERE id = CAST(:id AS uuid)",
+            {"id": str(segment_id)},
+        )
+        if not row:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Segmento não encontrado")
+        return row
+    row = await fetch_one(
+        db,
+        "UPDATE segments SET name = :name WHERE id = CAST(:id AS uuid) RETURNING *",
+        {"id": str(segment_id), "name": body.name.strip()},
+    )
+    if not row:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Segmento não encontrado")
+    await db.commit()
+    return row
+
+
+@router.delete("/segments/{segment_id}")
+async def delete_segment_v1(
+    segment_id: UUID,
+    ctx: Annotated[AuthContext, Depends(get_auth_context)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+):
+    if not is_admin_like(ctx.role):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Apenas administradores")
+    existing = await fetch_one(
+        db,
+        "SELECT id FROM segments WHERE id = CAST(:id AS uuid)",
+        {"id": str(segment_id)},
+    )
+    if not existing:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Segmento não encontrado")
+    in_use = await fetch_one(
+        db,
+        """
+        SELECT 1 AS x
+        FROM classrooms c
+        JOIN grades g ON g.id = c.grade_id
+        WHERE g.segment_id = CAST(:id AS uuid)
+        LIMIT 1
+        """,
+        {"id": str(segment_id)},
+    )
+    if in_use:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "Segmento com séries/turmas vinculadas; remova as turmas antes.",
+        )
+    await execute(db, "DELETE FROM segments WHERE id = CAST(:id AS uuid)", {"id": str(segment_id)})
+    await db.commit()
+    return {"ok": True}
+
+
+class GradeCreate(BaseModel):
+    segment_id: UUID
+    name: str = Field(..., min_length=1, max_length=255)
+
+
+class GradePatch(BaseModel):
+    segment_id: UUID | None = None
+    name: str | None = Field(None, min_length=1, max_length=255)
+
+
+@router.post("/grades")
+async def create_grade_v1(
+    body: GradeCreate,
+    ctx: Annotated[AuthContext, Depends(get_auth_context)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+):
+    if not is_admin_like(ctx.role):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Apenas administradores")
+    segment = await fetch_one(
+        db,
+        "SELECT id FROM segments WHERE id = CAST(:id AS uuid)",
+        {"id": str(body.segment_id)},
+    )
+    if not segment:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Segmento não encontrado")
+    row = await fetch_one(
+        db,
+        """
+        INSERT INTO grades (segment_id, name)
+        VALUES (CAST(:segment_id AS uuid), :name)
+        RETURNING *
+        """,
+        {"segment_id": str(body.segment_id), "name": body.name.strip()},
+    )
+    await db.commit()
+    return row
+
+
+@router.patch("/grades/{grade_id}")
+async def patch_grade_v1(
+    grade_id: UUID,
+    body: GradePatch,
+    ctx: Annotated[AuthContext, Depends(get_auth_context)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+):
+    if not is_admin_like(ctx.role):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Apenas administradores")
+    if body.segment_id is not None:
+        segment = await fetch_one(
+            db,
+            "SELECT id FROM segments WHERE id = CAST(:id AS uuid)",
+            {"id": str(body.segment_id)},
+        )
+        if not segment:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Segmento não encontrado")
+    sets: list[str] = []
+    params: dict[str, Any] = {"id": str(grade_id)}
+    if body.name is not None:
+        sets.append("name = :name")
+        params["name"] = body.name.strip()
+    if body.segment_id is not None:
+        sets.append("segment_id = CAST(:segment_id AS uuid)")
+        params["segment_id"] = str(body.segment_id)
+    if not sets:
+        row = await fetch_one(
+            db,
+            "SELECT * FROM grades WHERE id = CAST(:id AS uuid)",
+            {"id": str(grade_id)},
+        )
+        if not row:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Série não encontrada")
+        return row
+    row = await fetch_one(
+        db,
+        f"UPDATE grades SET {', '.join(sets)} WHERE id = CAST(:id AS uuid) RETURNING *",
+        params,
+    )
+    if not row:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Série não encontrada")
+    await db.commit()
+    return row
+
+
+@router.delete("/grades/{grade_id}")
+async def delete_grade_v1(
+    grade_id: UUID,
+    ctx: Annotated[AuthContext, Depends(get_auth_context)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+):
+    if not is_admin_like(ctx.role):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Apenas administradores")
+    existing = await fetch_one(
+        db,
+        "SELECT id FROM grades WHERE id = CAST(:id AS uuid)",
+        {"id": str(grade_id)},
+    )
+    if not existing:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Série não encontrada")
+    in_use = await fetch_one(
+        db,
+        "SELECT 1 AS x FROM classrooms WHERE grade_id = CAST(:id AS uuid) LIMIT 1",
+        {"id": str(grade_id)},
+    )
+    if in_use:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "Série com turmas vinculadas; remova ou mova as turmas antes.",
+        )
+    await execute(db, "DELETE FROM grades WHERE id = CAST(:id AS uuid)", {"id": str(grade_id)})
+    await db.commit()
+    return {"ok": True}

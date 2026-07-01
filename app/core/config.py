@@ -124,6 +124,33 @@ class Settings(BaseSettings):
         "Se vazio, usa app/v1/assets/Cartao_Resposta-modelo.pdf quando existir.",
     )
 
+    assistant_openai_api_key: str | None = Field(
+        default=None,
+        description="Chave OpenAI para o Avaliador (modo LLM). Se ausente, usa respostas stub.",
+    )
+    assistant_openai_model: str = Field(
+        default="gpt-4o-mini",
+        description="Modelo OpenAI para POST /v1/teacher/assistant/chat.",
+    )
+    assistant_openai_base_url: str = Field(
+        default="https://api.openai.com/v1",
+        description="Base URL da API compatível com OpenAI (permite proxies/Azure).",
+    )
+
+    groq_api_key: str | None = Field(
+        default=None,
+        description="Chave Groq (OpenAI-compatible). Usada quando BOT_LLM_SOURCE=env ou sem config ativa no banco.",
+    )
+    groq_model: str = Field(
+        default="llama-3.3-70b-versatile",
+        description="Modelo Groq para o Avaliador.",
+    )
+
+    bot_llm_source: Literal["db", "env"] = Field(
+        default="db",
+        description="db = bot_settings ativo; env = GROQ_API_KEY / ASSISTANT_OPENAI_* do .env",
+    )
+
     @model_validator(mode="after")
     def _validate_attendance_storage(self):
         if self.attendance_sheet_storage_backend == "gcs":

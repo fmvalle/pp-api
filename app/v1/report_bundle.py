@@ -497,6 +497,8 @@ WITH last_resp AS (
       LEFT JOIN assessment_schedules ass ON ass.id = lr.schedule_id
 )
 SELECT question_id,
+       count(*) FILTER (WHERE classroom_id = CAST(:cid AS uuid))::int AS classroom_resp,
+       count(*) FILTER (WHERE classroom_id = CAST(:cid AS uuid) AND is_correct)::int AS classroom_corr,
        count(*) FILTER (WHERE school_id = CAST(:sid AS uuid))::int AS school_resp,
        count(*) FILTER (WHERE school_id = CAST(:sid AS uuid) AND is_correct)::int AS school_corr,
        count(*)::int AS sys_resp,
@@ -715,7 +717,7 @@ async def assessment_pedagogical_report_bundle(
 
     pedagogical_reading = _build_pedagogical_reading(component_performance)
 
-    # --- Questão a questão -----------------------------------------------------
+    # --- Questões -----------------------------------------------------
     q_rows = await fetch_all(
         db,
         """
@@ -756,7 +758,7 @@ async def assessment_pedagogical_report_bundle(
     stat_rows = await fetch_all(
         db,
         _QUESTION_STATS_SQL,
-        {"aid": str(assessment_id), "sid": str(school_id)},
+        {"aid": str(assessment_id), "cid": str(classroom_id), "sid": str(school_id)},
     )
     stat_by_q: dict[str, dict[str, Any]] = {str(r.get("question_id")): r for r in stat_rows}
 
@@ -860,7 +862,7 @@ async def assessment_pedagogical_report_bundle(
         if is_correct is None:
             status_label = "—"
         else:
-            status_label = "Acertou" if is_correct else "Errou"
+            status_label = "Correta" if is_correct else "Incorreta"
         sel_counts = sel_by_q.get(qid, {})
         sel_total = sel_total_by_q.get(qid, 0)
         alternatives = []
@@ -887,6 +889,7 @@ async def assessment_pedagogical_report_bundle(
             "studentAnswer": student_answer,
             "isCorrect": is_correct,
             "statusLabel": status_label,
+            "classroomAccuracyPercentage": _pct(stat.get("classroom_corr"), stat.get("classroom_resp")),
             "schoolAccuracyPercentage": _pct(stat.get("school_corr"), stat.get("school_resp")),
             "systemAccuracyPercentage": _pct(stat.get("sys_corr"), stat.get("sys_resp")),
             "description": q.get("description_html") or q.get("description_raw"),
@@ -942,6 +945,245 @@ async def assessment_pedagogical_report_bundle(
         "pedagogicalReading": pedagogical_reading,
         "questionGroups": question_groups,
     }
+
+
+def slim_pedagogical_snapshot(
+    *,
+    assessment_id: str,
+    schedule_id: str | None,
+    assessment_title: str | None,
+    start_date: str | None,
+    summary: dict[str, Any],
+    component_performance: list[dict[str, Any]],
+    pedagogical_reading: dict[str, Any],
+    critical_questions: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Versão compacta do relatório pedagógico para contexto LLM."""
+    return {
+        "assessment_id": assessment_id,
+        "schedule_id": schedule_id,
+        "assessment_title": assessment_title,
+        "start_date": start_date,
+        "summary": {
+            "accuracy_percentage": summary.get("accuracyPercentage"),
+            "classroom_average": summary.get("classroomAverage"),
+            "school_average": summary.get("schoolAverage"),
+            "system_average": summary.get("systemAverage"),
+            "total_questions": summary.get("totalQuestions"),
+        },
+        "components": [
+            {
+                "name": c.get("componentName"),
+                "area": c.get("areaName"),
+                "accuracy": c.get("studentAccuracy"),
+                "comparison_average": c.get("comparisonAverage"),
+                "variation_pp": c.get("variationPercentagePoints"),
+                "action": c.get("pedagogicalAction"),
+            }
+            for c in component_performance
+        ],
+        "pedagogical_reading": {
+            "text": pedagogical_reading.get("text"),
+            "priority_components": [
+                {
+                    "name": p.get("componentName"),
+                    "action": p.get("pedagogicalAction"),
+                    "variation_pp": p.get("variationPercentagePoints"),
+                }
+                for p in (pedagogical_reading.get("priorityComponents") or [])
+            ],
+        },
+        "critical_questions": critical_questions,
+    }
+
+
+async def compact_pedagogical_snapshot_for_llm(
+    db: AsyncSession,
+    *,
+    assessment_id: UUID,
+    classroom_id: UUID,
+    schedule_id: UUID | None = None,
+    schedule_start: Any = None,
+    critical_questions_limit: int = 8,
+) -> dict[str, Any] | None:
+    """Snapshot leve do relatório pedagógico (turma) para o Avaliador."""
+    head = await fetch_one(
+        db,
+        """
+        SELECT a.id AS assessment_id, a.title AS assessment_title,
+               c.id AS classroom_id, c.name AS classroom_name, c.school_id
+        FROM classrooms c
+        JOIN assessments a ON a.id = CAST(:aid AS uuid)
+        WHERE c.id = CAST(:cid AS uuid)
+        """,
+        {"aid": str(assessment_id), "cid": str(classroom_id)},
+    )
+    if not head:
+        return None
+
+    school_id = head.get("school_id")
+    comp_base_params = {"aid": str(assessment_id), "cid": str(classroom_id)}
+
+    avg_row = await fetch_one(
+        db,
+        _SUMMARY_AVERAGES_SQL,
+        {"aid": str(assessment_id), "cid": str(classroom_id), "sid": str(school_id)},
+    )
+    classroom_avg = float((avg_row or {}).get("classroom_avg") or 0.0)
+    school_avg = float((avg_row or {}).get("school_avg") or 0.0)
+    system_avg = float((avg_row or {}).get("system_avg") or 0.0)
+
+    comp_rows = await fetch_all(
+        db,
+        f"""
+        WITH comp AS ({_COMPONENT_RESULTS_SQL})
+        SELECT discipline_name, discipline_slug, area_slug,
+               AVG(acc) AS classroom_acc,
+               SUM(total_questions) AS sum_tq,
+               SUM(correct_answers) AS sum_ca
+          FROM comp
+         GROUP BY discipline_name, discipline_slug, area_slug
+         ORDER BY discipline_name
+        """,
+        comp_base_params,
+    )
+    if not comp_rows:
+        return None
+
+    area_name_by_slug = await _load_area_name_map(db)
+
+    def _area_name(slug: Any, fallback: str) -> str:
+        if slug and str(slug) in area_name_by_slug:
+            return str(area_name_by_slug[str(slug)])
+        return fallback
+
+    component_performance: list[dict[str, Any]] = []
+    for r in comp_rows:
+        name = str(r.get("discipline_name") or "Sem componente")
+        comparison_avg = float(r.get("classroom_acc") or 0.0)
+        tq = int(r.get("sum_tq") or 0)
+        ca = int(r.get("sum_ca") or 0)
+        student_accuracy = comparison_avg
+        variation = round(student_accuracy - comparison_avg, 1)
+        component_performance.append(
+            {
+                "componentId": str(r.get("discipline_slug") or name),
+                "componentName": name,
+                "areaName": _area_name(r.get("area_slug"), name),
+                "studentAccuracy": round(student_accuracy, 1),
+                "comparisonAverage": round(comparison_avg, 1),
+                "variationPercentagePoints": variation,
+                "pedagogicalAction": _pedagogical_action(variation),
+            }
+        )
+
+    total_questions = await fetch_one(
+        db,
+        "SELECT COUNT(*)::int AS n FROM questions_assessments WHERE assessment_id = CAST(:aid AS uuid)",
+        {"aid": str(assessment_id)},
+    )
+    total_q = int((total_questions or {}).get("n") or 0)
+
+    summary = {
+        "totalQuestions": total_q,
+        "correctAnswers": 0,
+        "accuracyPercentage": round(classroom_avg, 1),
+        "classroomAverage": round(classroom_avg, 1),
+        "schoolAverage": round(school_avg, 1),
+        "systemAverage": round(system_avg, 1),
+    }
+    pedagogical_reading = _build_pedagogical_reading(component_performance)
+
+    q_rows = await fetch_all(
+        db,
+        """
+        SELECT qa.question_id, qa.order_index, qi.discipline_name
+        FROM questions_assessments qa
+        JOIN question_item qi ON qi.id = qa.question_id
+        WHERE qa.assessment_id = CAST(:aid AS uuid)
+        ORDER BY qa.order_index
+        """,
+        {"aid": str(assessment_id)},
+    )
+    stat_rows = await fetch_all(
+        db,
+        _QUESTION_STATS_SQL,
+        {"aid": str(assessment_id), "cid": str(classroom_id), "sid": str(school_id)},
+    )
+    stat_by_q = {str(r.get("question_id")): r for r in stat_rows}
+
+    question_candidates: list[dict[str, Any]] = []
+    for q in q_rows:
+        qid = str(q.get("question_id") or "")
+        stat = stat_by_q.get(qid) or {}
+        resp = int(stat.get("classroom_resp") or 0)
+        corr = int(stat.get("classroom_corr") or 0)
+        if resp <= 0:
+            continue
+        question_candidates.append(
+            {
+                "question_id": qid,
+                "order": int(q.get("order_index") or 0) + 1,
+                "component": q.get("discipline_name"),
+                "classroom_accuracy_pct": round(100.0 * corr / resp, 1),
+                "responses": resp,
+            }
+        )
+    question_candidates.sort(key=lambda item: (item["classroom_accuracy_pct"], item["order"]))
+    top_critical = question_candidates[:critical_questions_limit]
+
+    skill_by_q: dict[str, dict[str, Any]] = {}
+    if top_critical:
+        qids = [c["question_id"] for c in top_critical]
+        skill_rows = await fetch_all(
+            db,
+            """
+            SELECT qit.question_id, qt.external_id AS code, qt.label AS description, qt.tag_type
+            FROM question_item_tag qit
+            JOIN question_tag qt ON qt.id = qit.tag_id
+            WHERE qit.question_id = ANY(CAST(:qids AS uuid[]))
+              AND qt.tag_type IN ('skill', 'topic')
+            """,
+            {"qids": qids},
+        )
+        for sr in skill_rows:
+            qid = str(sr.get("question_id") or "")
+            if not qid:
+                continue
+            if qid not in skill_by_q or sr.get("tag_type") == "skill":
+                skill_by_q[qid] = {
+                    "code": sr.get("code"),
+                    "description": sr.get("description"),
+                }
+
+    critical_questions: list[dict[str, Any]] = []
+    for item in top_critical:
+        skill = skill_by_q.get(item["question_id"]) or {}
+        critical_questions.append(
+            {
+                "order": item["order"],
+                "component": item.get("component"),
+                "skill_code": skill.get("code"),
+                "skill_description": skill.get("description"),
+                "classroom_accuracy_pct": item["classroom_accuracy_pct"],
+                "responses": item["responses"],
+            }
+        )
+
+    start_date = None
+    if schedule_start is not None:
+        start_date = str(schedule_start)[:10] if schedule_start else None
+
+    return slim_pedagogical_snapshot(
+        assessment_id=str(assessment_id),
+        schedule_id=str(schedule_id) if schedule_id else None,
+        assessment_title=head.get("assessment_title"),
+        start_date=start_date,
+        summary=summary,
+        component_performance=component_performance,
+        pedagogical_reading=pedagogical_reading,
+        critical_questions=critical_questions,
+    )
 
 
 async def assert_can_read_schedule_report(
