@@ -259,11 +259,89 @@ async def resolve_macro_scope_school(
     }
 
 
+async def _component_accuracy_averages(
+    db: AsyncSession,
+    *,
+    assessment_ids: list[str],
+    scope_classroom_ids: list[str],
+    reference_classroom_ids: list[str] | None = None,
+) -> tuple[dict[tuple[str, str, str], float], dict[tuple[str, str, str], float]]:
+    """Média de acurácia por componente no escopo e na referência (média por aluno)."""
+    ref_filter = bool(reference_classroom_ids)
+    rows = await fetch_all(
+        db,
+        """
+        WITH per_student AS (
+            SELECT COALESCE(discipline_name, 'Sem componente') AS discipline_name,
+                   discipline_slug,
+                   area_slug,
+                   classroom_id,
+                   student_id,
+                   CASE WHEN SUM(total_questions) > 0
+                        THEN 100.0 * SUM(correct_answers) / SUM(total_questions)
+                        ELSE 0 END AS acc
+            FROM vw_assessment_component_results
+            WHERE assessment_id = ANY(CAST(:aids AS uuid[]))
+            GROUP BY discipline_name, discipline_slug, area_slug,
+                     classroom_id, student_id
+        )
+        SELECT discipline_name, discipline_slug, area_slug,
+               AVG(acc) FILTER (
+                 WHERE classroom_id = ANY(CAST(:scope_cids AS uuid[]))
+               ) AS scope_acc,
+               AVG(acc) FILTER (
+                 WHERE CAST(:use_ref AS boolean) = false
+                    OR classroom_id = ANY(CAST(:ref_cids AS uuid[]))
+               ) AS ref_acc
+        FROM per_student
+        GROUP BY discipline_name, discipline_slug, area_slug
+        """,
+        {
+            "aids": assessment_ids,
+            "scope_cids": scope_classroom_ids,
+            "use_ref": ref_filter,
+            "ref_cids": reference_classroom_ids or scope_classroom_ids,
+        },
+    )
+
+    def _key(dn: Any, ds: Any, ar: Any) -> tuple[str, str, str]:
+        return (str(ds or ""), str(dn or ""), str(ar or ""))
+
+    scope_by: dict[tuple[str, str, str], float] = {}
+    ref_by: dict[tuple[str, str, str], float] = {}
+    for r in rows:
+        key = _key(r.get("discipline_name"), r.get("discipline_slug"), r.get("area_slug"))
+        if r.get("scope_acc") is not None:
+            scope_by[key] = float(r["scope_acc"])
+        if r.get("ref_acc") is not None:
+            ref_by[key] = float(r["ref_acc"])
+    return scope_by, ref_by
+
+
+def _area_proficiencies_from_averages(
+    prof_avg_by_area: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    for slug in sorted(prof_avg_by_area.keys()):
+        prof = prof_avg_by_area[slug]
+        if prof.get("proficiency") is None:
+            continue
+        items.append(
+            {
+                "areaSlug": slug,
+                "areaName": prof.get("areaName") or slug,
+                "proficiency": round(float(prof["proficiency"]), 1),
+            }
+        )
+    return items
+
+
 async def _component_performance(
     db: AsyncSession,
     *,
     assessment_ids: list[str],
     classroom_ids: list[str],
+    reference_classroom_ids: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Lista de componentes a partir da BASE de questões dos cadernos.
 
@@ -326,17 +404,27 @@ async def _component_performance(
         db, assessment_ids=assessment_ids, classroom_ids=classroom_ids
     )
 
+    scope_acc_by, ref_acc_by = await _component_accuracy_averages(
+        db,
+        assessment_ids=assessment_ids,
+        scope_classroom_ids=classroom_ids,
+        reference_classroom_ids=reference_classroom_ids,
+    )
+
     out: list[dict[str, Any]] = []
     for b in base_rows:
         name = str(b.get("discipline_name") or "Sem componente")
         area_slug = str(b.get("area_slug") or "")
         base_q = int(b.get("base_questions") or 0)
         per_caderno = round(base_q / num_cadernos)
-        rr = resp_by.get(_key(b.get("discipline_name"), b.get("discipline_slug"), b.get("area_slug"))) or {}
+        comp_key = _key(b.get("discipline_name"), b.get("discipline_slug"), b.get("area_slug"))
+        rr = resp_by.get(comp_key) or {}
         tq_resp = int(rr.get("tq") or 0)
         ca_resp = int(rr.get("ca") or 0)
-        accuracy = round(100.0 * ca_resp / tq_resp, 1) if tq_resp > 0 else 0.0
-        variation = 0.0
+        aggregate_accuracy = round(100.0 * ca_resp / tq_resp, 1) if tq_resp > 0 else 0.0
+        student_accuracy = round(scope_acc_by.get(comp_key, aggregate_accuracy), 1)
+        comparison_avg = round(ref_acc_by.get(comp_key, student_accuracy), 1)
+        variation = round(student_accuracy - comparison_avg, 1)
         prof = prof_avg_by_area.get(area_slug) if area_slug else None
         item: dict[str, Any] = {
             "componentId": str(b.get("discipline_slug") or name),
@@ -345,8 +433,8 @@ async def _component_performance(
             "areaSlug": area_slug or None,
             "totalQuestions": per_caderno,
             "correctAnswers": ca_resp,
-            "studentAccuracy": accuracy,
-            "comparisonAverage": accuracy,
+            "studentAccuracy": student_accuracy,
+            "comparisonAverage": comparison_avg,
             "variationPercentagePoints": variation,
             "pedagogicalAction": _pedagogical_action(variation),
         }
@@ -506,8 +594,16 @@ async def macro_components_report_for_classrooms(
     system_avg = float((avg_row or {}).get("system_avg") or 0.0)
 
     component_performance = await _component_performance(
+        db,
+        assessment_ids=assessment_ids,
+        classroom_ids=classroom_ids,
+        reference_classroom_ids=None,
+    )
+
+    prof_avg_by_area = await average_proficiency_by_area(
         db, assessment_ids=assessment_ids, classroom_ids=classroom_ids
     )
+    area_proficiencies = _area_proficiencies_from_averages(prof_avg_by_area)
 
     total_row = await fetch_one(
         db,
@@ -533,6 +629,7 @@ async def macro_components_report_for_classrooms(
         "summary": summary,
         "componentPerformance": component_performance,
         "pedagogicalReading": _build_pedagogical_reading(component_performance),
+        "areaProficiencies": area_proficiencies,
     }
 
 
@@ -606,6 +703,19 @@ async def macro_components_report(
     head = await _classroom_head(db, classroom_id)
     school_id = head.get("school_id")
 
+    school_classroom_rows = await fetch_all(
+        db,
+        """
+        SELECT DISTINCT c.id
+        FROM classrooms c
+        JOIN assessment_schedules s ON s.classroom_id = c.id
+        WHERE s.assessment_id = ANY(CAST(:aids AS uuid[]))
+          AND c.school_id = CAST(:sid AS uuid)
+        """,
+        {"aids": assessment_ids, "sid": str(school_id)},
+    )
+    reference_classroom_ids = [str(r["id"]) for r in school_classroom_rows]
+
     # Médias por aluno consolidando todos os cadernos.
     avg_row = await fetch_one(
         db,
@@ -637,8 +747,18 @@ async def macro_components_report(
     # Lista de componentes a partir da base de questões dos cadernos (aparecem
     # mesmo sem respostas); acertos vêm das respostas da turma.
     component_performance = await _component_performance(
-        db, assessment_ids=assessment_ids, classroom_ids=[str(classroom_id)]
+        db,
+        assessment_ids=assessment_ids,
+        classroom_ids=[str(classroom_id)],
+        reference_classroom_ids=reference_classroom_ids or None,
     )
+
+    prof_avg_by_area = await average_proficiency_by_area(
+        db,
+        assessment_ids=assessment_ids,
+        classroom_ids=[str(classroom_id)],
+    )
+    area_proficiencies = _area_proficiencies_from_averages(prof_avg_by_area)
 
     # Total de itens da base (todos os cadernos).
     total_row = await fetch_one(
@@ -665,6 +785,7 @@ async def macro_components_report(
         "summary": summary,
         "componentPerformance": component_performance,
         "pedagogicalReading": _build_pedagogical_reading(component_performance),
+        "areaProficiencies": area_proficiencies,
     }
 
 

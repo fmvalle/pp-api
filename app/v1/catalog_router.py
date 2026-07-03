@@ -74,6 +74,11 @@ async def list_schools_v1(
     db: Annotated[AsyncSession, Depends(get_db)],
     tree: bool = Query(False, description="Se true, retorna schools_tree"),
     root_id: UUID | None = Query(None, description="Filtrar raiz da árvore (opcional)"),
+    school_type: str | None = Query(
+        None,
+        alias="type",
+        description="Filtrar por tipo de escola (ex.: school unit)",
+    ),
     pg: Annotated[PageArgs, Depends(pagination_params)] = PageArgs(1, 50),
 ):
     scope = await get_effective_school_scope(db, ctx)
@@ -83,6 +88,9 @@ async def list_schools_v1(
         if root_id:
             sql += " AND root_id = CAST(:root_id AS uuid)"
             params["root_id"] = str(root_id)
+        if school_type:
+            sql += " AND type = CAST(:school_type AS school_type)"
+            params["school_type"] = school_type
         if not scope["is_admin_like"]:
             sql += " AND id = ANY(CAST(:effective_school_ids AS uuid[]))"
             params["effective_school_ids"] = [str(x) for x in scope["effective_school_ids"]]
@@ -92,6 +100,9 @@ async def list_schools_v1(
         return paged_response(page=pg.page, per_page=pg.per_page, total=(count_row or {}).get("total", 0), items=items)
     sql = "SELECT * FROM schools WHERE 1=1"
     params = {}
+    if school_type:
+        sql += " AND type = CAST(:school_type AS school_type)"
+        params["school_type"] = school_type
     if not scope["is_admin_like"]:
         sql += " AND id = ANY(CAST(:effective_school_ids AS uuid[]))"
         params["effective_school_ids"] = [str(x) for x in scope["effective_school_ids"]]

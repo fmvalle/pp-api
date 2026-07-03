@@ -19,3 +19,11 @@ async def fetch_one(db: AsyncSession, sql: str, params: dict[str, Any] | None = 
 
 async def execute(db: AsyncSession, sql: str, params: dict[str, Any] | None = None) -> None:
     await db.execute(text(sql), params or {})
+
+
+async def execute_many(
+    db: AsyncSession, sql: str, params_list: list[dict[str, Any]]
+) -> None:
+    if not params_list:
+        return
+    await db.execute(text(sql), params_list)
