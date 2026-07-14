@@ -1121,6 +1121,11 @@ async def teacher_macro_assessments_v1(
         return sql
 
     # Macro avaliações (consolidadas).
+    macro_schedule_cols = _schedule_status_sql(
+        link_column="a_sch.macro_assessment_id",
+        link_value_sql="v.macro_assessment_id",
+        classroom_sql="v.classroom_id",
+    )
     macro_sql = f"""
     SELECT v.macro_assessment_id, v.classroom_id, v.school_id,
            MIN(c.name) AS classroom_name,
@@ -1131,7 +1136,8 @@ async def teacher_macro_assessments_v1(
            bool_or(v.is_active) AS is_active,
            COALESCE(SUM(v.pending), 0)::int AS pending,
            COALESCE(SUM(v.completed), 0)::int AS completed,
-           COALESCE(SUM(v.did_not_deliver), 0)::int AS did_not_deliver
+           COALESCE(SUM(v.did_not_deliver), 0)::int AS did_not_deliver,
+           {macro_schedule_cols}
     FROM vw_macro_assessment_summary v
     JOIN classrooms c ON c.id = v.classroom_id
     WHERE v.macro_assessment_id IS NOT NULL
@@ -1142,13 +1148,19 @@ async def teacher_macro_assessments_v1(
     macro_rows = await fetch_all(db, macro_sql, params)
 
     # Cadernos avulsos (sem macro) — compatibilidade.
+    legacy_schedule_cols = _schedule_status_sql(
+        link_column="sch.assessment_id",
+        link_value_sql="vas.assessment_id",
+        classroom_sql="vas.classroom_id",
+    )
     legacy_sql = f"""
     SELECT vas.assessment_id, vas.classroom_id, vas.school_id,
            c.name AS classroom_name,
            vas.title, vas.description, vas.type, vas.year, vas.is_active,
            COALESCE(vas.pending, 0)::int AS pending,
            COALESCE(vas.completed, 0)::int AS completed,
-           COALESCE(vas.did_not_deliver, 0)::int AS did_not_deliver
+           COALESCE(vas.did_not_deliver, 0)::int AS did_not_deliver,
+           {legacy_schedule_cols}
     FROM vw_assessment_summary vas
     JOIN classrooms c ON c.id = vas.classroom_id
     JOIN assessments a ON a.id = vas.assessment_id
@@ -1176,6 +1188,7 @@ async def teacher_macro_assessments_v1(
                 "pending": int(r.get("pending") or 0),
                 "completed": int(r.get("completed") or 0),
                 "didNotDeliver": int(r.get("did_not_deliver") or 0),
+                **_schedule_status_fields(r),
             }
         )
     for r in legacy_rows:
@@ -1195,6 +1208,7 @@ async def teacher_macro_assessments_v1(
                 "pending": int(r.get("pending") or 0),
                 "completed": int(r.get("completed") or 0),
                 "didNotDeliver": int(r.get("did_not_deliver") or 0),
+                **_schedule_status_fields(r),
             }
         )
     items.sort(key=lambda x: ((x.get("classroomName") or "").lower(), (x["title"] or "").lower()))
@@ -1282,6 +1296,53 @@ async def _resolve_school_ids(
     return ids
 
 
+_SCHEDULE_END_DATE_BEFORE_TODAY = (
+    "(sch.end_time AT TIME ZONE 'utc')::date < (now() AT TIME ZONE 'utc')::date"
+)
+
+
+def _schedule_status_sql(
+    *,
+    link_column: str,
+    link_value_sql: str,
+    classroom_sql: str | None = None,
+    school_sql: str = "",
+    academic_year_sql: str = "",
+) -> str:
+    """Contagem de agendamentos e flag se todos já encerraram (data final < hoje)."""
+    classroom_clause = f"AND sch.classroom_id = {classroom_sql}" if classroom_sql else ""
+    schedule_scope = f"""
+      FROM assessment_schedules sch
+      JOIN assessments a_sch ON a_sch.id = sch.assessment_id
+      JOIN classrooms c_sch ON c_sch.id = sch.classroom_id
+      WHERE {link_column} = {link_value_sql}
+        {classroom_clause}
+        {school_sql}
+        {academic_year_sql}
+    """
+    return f"""
+           (
+             SELECT COUNT(*)::int
+             {schedule_scope}
+           ) AS schedule_count,
+           COALESCE(
+             (
+               SELECT COUNT(*) > 0
+                      AND bool_and({_SCHEDULE_END_DATE_BEFORE_TODAY})
+               {schedule_scope}
+             ),
+             false
+           ) AS all_schedules_ended
+    """
+
+
+def _schedule_status_fields(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "scheduleCount": int(row.get("schedule_count") or 0),
+        "allSchedulesEnded": bool(row.get("all_schedules_ended")),
+    }
+
+
 def _scheduling_window_fields(row: dict[str, Any]) -> dict[str, Any]:
     """Campos de vigência para habilitar/desabilitar agendamento no app."""
     start = row.get("start_date")
@@ -1309,7 +1370,15 @@ async def school_admin_macro_assessments_v1(
     school_ids = await _resolve_school_ids(db, ctx, school_id)
     params: dict[str, Any] = {"ay": str(effective_ay), "sids": [str(s) for s in school_ids]}
 
-    macro_sql = """
+    school_scope_sql = "AND c_sch.school_id = ANY(CAST(:sids AS uuid[]))"
+    ay_scope_sql = "AND c_sch.academic_year_id = CAST(:ay AS uuid)"
+    macro_schedule_cols = _schedule_status_sql(
+        link_column="a_sch.macro_assessment_id",
+        link_value_sql="v.macro_assessment_id",
+        school_sql=school_scope_sql,
+        academic_year_sql=ay_scope_sql,
+    )
+    macro_sql = f"""
     SELECT v.macro_assessment_id,
            MIN(c.school_id::text) AS school_id,
            MIN(v.title) AS title,
@@ -1328,7 +1397,8 @@ async def school_admin_macro_assessments_v1(
            COUNT(DISTINCT v.classroom_id) AS classrooms,
            COALESCE(SUM(v.pending), 0)::int AS pending,
            COALESCE(SUM(v.completed), 0)::int AS completed,
-           COALESCE(SUM(v.did_not_deliver), 0)::int AS did_not_deliver
+           COALESCE(SUM(v.did_not_deliver), 0)::int AS did_not_deliver,
+           {macro_schedule_cols}
     FROM vw_macro_assessment_summary v
     JOIN classrooms c ON c.id = v.classroom_id
     LEFT JOIN macro_assessments ma ON ma.id = v.macro_assessment_id
@@ -1339,7 +1409,13 @@ async def school_admin_macro_assessments_v1(
     """
     macro_rows = await fetch_all(db, macro_sql, params)
 
-    legacy_sql = """
+    legacy_schedule_cols = _schedule_status_sql(
+        link_column="sch.assessment_id",
+        link_value_sql="vas.assessment_id",
+        school_sql=school_scope_sql,
+        academic_year_sql=ay_scope_sql,
+    )
+    legacy_sql = f"""
     SELECT vas.assessment_id,
            MIN(c.school_id::text) AS school_id,
            MIN(vas.title) AS title,
@@ -1359,7 +1435,8 @@ async def school_admin_macro_assessments_v1(
            COUNT(DISTINCT vas.classroom_id) AS classrooms,
            COALESCE(SUM(vas.pending), 0)::int AS pending,
            COALESCE(SUM(vas.completed), 0)::int AS completed,
-           COALESCE(SUM(vas.did_not_deliver), 0)::int AS did_not_deliver
+           COALESCE(SUM(vas.did_not_deliver), 0)::int AS did_not_deliver,
+           {legacy_schedule_cols}
     FROM vw_assessment_summary vas
     JOIN classrooms c ON c.id = vas.classroom_id
     JOIN assessments a ON a.id = vas.assessment_id
@@ -1389,6 +1466,7 @@ async def school_admin_macro_assessments_v1(
                 "pending": int(r.get("pending") or 0),
                 "completed": int(r.get("completed") or 0),
                 "didNotDeliver": int(r.get("did_not_deliver") or 0),
+                **_schedule_status_fields(r),
                 **_scheduling_window_fields(r),
             }
         )
@@ -1408,6 +1486,7 @@ async def school_admin_macro_assessments_v1(
                 "pending": int(r.get("pending") or 0),
                 "completed": int(r.get("completed") or 0),
                 "didNotDeliver": int(r.get("did_not_deliver") or 0),
+                **_schedule_status_fields(r),
                 **_scheduling_window_fields(r),
             }
         )

@@ -124,6 +124,7 @@ class UserCreateBody(BaseModel):
     email: str
     role: str | None = None
     school_id: UUID | None = None
+    code: str | None = None
     phone: str | None = None
     document: str | None = None
     birthdate: str | None = None
@@ -153,6 +154,9 @@ async def _create_user_with_profile(
 ) -> dict:
     if not body.role:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "role é obrigatório")
+    profile_code = (body.code or "").strip() or None
+    auth_provider = "firebase" if body.create_firebase_user else "database"
+    can_login = body.create_firebase_user
     people_row = await fetch_one(
         db,
         """
@@ -162,7 +166,7 @@ async def _create_user_with_profile(
         )
         VALUES (
             gen_random_uuid(), 'published', :full_name, :email, :phone, :document,
-            CAST(:birthdate AS date), :metadata, 'firebase', true, now()
+            CAST(:birthdate AS date), :metadata, :auth_provider, :can_login, now()
         )
         RETURNING id
         """,
@@ -173,6 +177,8 @@ async def _create_user_with_profile(
             "document": body.document,
             "birthdate": body.birthdate,
             "metadata": body.metadata,
+            "auth_provider": auth_provider,
+            "can_login": can_login,
         },
     )
     assert people_row is not None
@@ -230,7 +236,7 @@ async def _create_user_with_profile(
         {
             "role": body.role,
             "school_id": str(body.school_id) if body.school_id else None,
-            "code": None,
+            "code": profile_code,
             "person_id": str(person_id),
         },
     )
@@ -512,7 +518,11 @@ def _parse_uuid_opt(val: Any) -> UUID | None:
     return UUID(s)
 
 
-def _dict_csv_row_to_user_create(row: dict[str, Any]) -> UserCreateBody:
+def _dict_csv_row_to_user_create(
+    row: dict[str, Any],
+    *,
+    default_create_firebase_user: bool = True,
+) -> UserCreateBody:
     """Converte linha CSV do app Flutter em [UserCreateBody] (POST /v1/users/import rows=…)."""
     fn = str(row.get("full_name") or "").strip()
     em = str(row.get("email") or "").strip()
@@ -534,13 +544,21 @@ def _dict_csv_row_to_user_create(row: dict[str, Any]) -> UserCreateBody:
         school_uuid = _parse_uuid_opt(school_raw)
     pwd = row.get("password")
     pwd_s = str(pwd).strip() if pwd is not None else ""
+    code_raw = row.get("code")
+    code_s = str(code_raw).strip() if code_raw is not None else ""
+    create_firebase = row.get("create_firebase_user")
+    if create_firebase is None or str(create_firebase).strip() == "":
+        create_firebase_user = default_create_firebase_user
+    else:
+        create_firebase_user = str(create_firebase).strip().lower() in ("1", "true", "yes", "sim")
     return UserCreateBody(
         full_name=fn,
         email=em,
         role=role_raw,
         school_id=school_uuid,
+        code=code_s or None,
         temporary_password=pwd_s if pwd_s else None,
-        create_firebase_user=True,
+        create_firebase_user=create_firebase_user,
     )
 
 
@@ -585,6 +603,7 @@ class ImportUsersRequest(BaseModel):
     rows: list[dict[str, Any]] | None = None
     continue_on_error: bool = True
     skip_existing_email: bool = True
+    create_firebase_user: bool = True
     idempotency_key: str | None = None
 
     @model_validator(mode="after")
@@ -608,7 +627,16 @@ async def import_users_v1(
     if payload.rows is not None:
         for i, raw in enumerate(payload.rows):
             try:
-                bodies.append((i, _dict_csv_row_to_user_create(raw), raw))
+                bodies.append(
+                    (
+                        i,
+                        _dict_csv_row_to_user_create(
+                            raw,
+                            default_create_firebase_user=payload.create_firebase_user,
+                        ),
+                        raw,
+                    )
+                )
             except ValueError as ve:
                 errors.append({"index": i, "email": raw.get("email"), "error": str(ve)})
                 if not payload.continue_on_error:
@@ -633,7 +661,15 @@ async def import_users_v1(
         {},
     )
     if payload.rows is not None:
-        normalized_payload = json.dumps(payload.rows, sort_keys=True, default=str, ensure_ascii=True)
+        normalized_payload = json.dumps(
+            {
+                "rows": payload.rows,
+                "create_firebase_user": payload.create_firebase_user,
+            },
+            sort_keys=True,
+            default=str,
+            ensure_ascii=True,
+        )
     else:
         normalized_payload = json.dumps(
             [u.model_dump(mode="json") for u in (payload.users or [])],
@@ -919,6 +955,42 @@ async def create_teacher_v1(
     return await _create_user_with_profile(db, body=b)
 
 
+@router.get("/teachers/eligible-for-classroom")
+async def teachers_eligible_v1(
+    classroom_id: UUID,
+    ctx: Annotated[AuthContext, Depends(get_auth_context)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+):
+    """Professores elegíveis para a turma (escola da turma + escolas ancestrais)."""
+    c = await fetch_one(
+        db,
+        "SELECT school_id FROM classrooms WHERE id = CAST(:id AS uuid)",
+        {"id": str(classroom_id)},
+    )
+    if not c:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Classroom not found")
+    sid = c["school_id"]
+    sscope = await get_effective_school_scope(db, ctx)
+    if not sscope["is_admin_like"] and str(sid) not in {str(x) for x in (sscope["effective_school_ids"] or [])}:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Fora do escopo")
+    return await fetch_all(
+        db,
+        """
+        WITH RECURSIVE ancestors AS (
+          SELECT id, parent FROM schools WHERE id = CAST(:sid AS uuid)
+          UNION ALL
+          SELECT s.id, s.parent FROM schools s
+          JOIN ancestors a ON a.parent = s.id
+        )
+        SELECT vp.*
+        FROM vw_profiles vp
+        WHERE vp.role::text ILIKE '%teacher%'
+          AND vp.school_id IN (SELECT id FROM ancestors)
+        """,
+        {"sid": str(sid)},
+    )
+
+
 @router.get("/teachers/{teacher_id}")
 async def get_teacher_v1(
     teacher_id: UUID,
@@ -1006,39 +1078,3 @@ async def delete_teacher_v1(
     db: Annotated[AsyncSession, Depends(get_db)],
 ):
     return await delete_user_v1(teacher_id, ctx, db)
-
-
-@router.get("/teachers/eligible-for-classroom")
-async def teachers_eligible_v1(
-    classroom_id: UUID,
-    ctx: Annotated[AuthContext, Depends(get_auth_context)],
-    db: Annotated[AsyncSession, Depends(get_db)],
-):
-    """Substitui school_self_and_ancestors com CTE recursiva de ancestrais da escola da turma."""
-    c = await fetch_one(
-        db,
-        "SELECT school_id FROM classrooms WHERE id = CAST(:id AS uuid)",
-        {"id": str(classroom_id)},
-    )
-    if not c:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Classroom not found")
-    sid = c["school_id"]
-    sscope = await get_effective_school_scope(db, ctx)
-    if not sscope["is_admin_like"] and str(sid) not in {str(x) for x in (sscope["effective_school_ids"] or [])}:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Fora do escopo")
-    return await fetch_all(
-        db,
-        """
-        WITH RECURSIVE ancestors AS (
-          SELECT id, parent FROM schools WHERE id = CAST(:sid AS uuid)
-          UNION ALL
-          SELECT s.id, s.parent FROM schools s
-          JOIN ancestors a ON a.parent = s.id
-        )
-        SELECT vp.*
-        FROM vw_profiles vp
-        WHERE vp.role::text ILIKE '%teacher%'
-          AND vp.school_id IN (SELECT id FROM ancestors)
-        """,
-        {"sid": str(sid)},
-    )

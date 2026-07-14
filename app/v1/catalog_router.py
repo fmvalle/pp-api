@@ -18,6 +18,7 @@ from app.v1._scope import (
     get_effective_classroom_scope,
     get_effective_school_scope,
     is_admin_like,
+    is_staff_admin_role,
     is_teacher_like,
 )
 from app.v1._sql import execute, fetch_all, fetch_one
@@ -63,6 +64,11 @@ async def _fetch_classroom_by_id_scoped(
     if not cscope["is_admin_like"] and str(row["id"]) not in {str(x) for x in cscope["effective_classroom_ids"]}:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Fora do escopo")
     return row
+
+
+def _assert_staff_can_mutate_classroom(ctx: AuthContext) -> None:
+    if not is_staff_admin_role(ctx.role):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Apenas administradores")
 
 
 # --- Schools ---
@@ -498,24 +504,38 @@ async def list_classroom_students_v1(
     effective_ay = await resolve_academic_year_id(db, academic_year_id)
     await _fetch_classroom_scoped(db, ctx, classroom_id, academic_year_id)
     params: dict[str, Any] = {"cid": str(classroom_id)}
-    where_parts = ["v.classroom_id = CAST(:cid AS uuid)"]
+    where_parts = ["cs.classroom_id = CAST(:cid AS uuid)", "p2.status = 'published'"]
     if teacher_id:
-        where_parts.append("v.teacher_id = CAST(:tid AS uuid)")
+        where_parts.append(
+            """EXISTS (
+              SELECT 1 FROM classroom_teachers ct
+              WHERE ct.classroom_id = cs.classroom_id
+                AND ct.teacher_id = CAST(:tid AS uuid)
+            )"""
+        )
         params["tid"] = str(teacher_id)
     if q and q.strip():
         where_parts.append(
-            "(v.full_name ILIKE :qpat OR v.email ILIKE :qpat OR (v.code IS NOT NULL AND v.code::text ILIKE :qpat))"
+            "(p2.full_name ILIKE :qpat OR p2.email ILIKE :qpat OR (p.code IS NOT NULL AND p.code::text ILIKE :qpat))"
         )
         params["qpat"] = f"%{q.strip()}%"
     where_sql = " AND ".join(where_parts)
     base = f"""
-        SELECT DISTINCT ON (v.student_id)
-          v.classroom_id, v.student_id, v.code, v.full_name, v.email, v.metadata, v.teacher_id
-        FROM vw_classroom_students v
+        SELECT
+          cs.classroom_id,
+          cs.student_id,
+          p.code,
+          p2.full_name,
+          p2.email,
+          p2.metadata,
+          cs.enrollment_code
+        FROM classroom_students cs
+        JOIN profiles p ON p.id = cs.student_id
+        JOIN people p2 ON p2.id = p.person_id
         WHERE {where_sql}
-        ORDER BY v.student_id, v.teacher_id
+        ORDER BY p2.full_name NULLS LAST, cs.student_id
     """
-    count_sql = f"SELECT COUNT(*)::int AS total FROM ({base}) _distinct_students"
+    count_sql = f"SELECT COUNT(*)::int AS total FROM ({base}) _students"
     count_row = await fetch_one(db, count_sql, params)
     total = (count_row or {}).get("total", 0)
     items = await fetch_all(
@@ -545,8 +565,7 @@ async def add_classroom_student_v1(
     db: Annotated[AsyncSession, Depends(get_db)],
 ):
     await _fetch_classroom_by_id_scoped(db, ctx, classroom_id)
-    if not is_admin_like(ctx.role):
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Apenas administradores")
+    _assert_staff_can_mutate_classroom(ctx)
     row = await fetch_one(
         db,
         """
@@ -570,8 +589,7 @@ async def remove_classroom_student_v1(
     db: Annotated[AsyncSession, Depends(get_db)],
 ):
     await _fetch_classroom_by_id_scoped(db, ctx, classroom_id)
-    if not is_admin_like(ctx.role):
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Apenas administradores")
+    _assert_staff_can_mutate_classroom(ctx)
     await execute(
         db,
         """
@@ -629,8 +647,7 @@ async def add_classroom_teacher_v1(
     db: Annotated[AsyncSession, Depends(get_db)],
 ):
     await _fetch_classroom_by_id_scoped(db, ctx, classroom_id)
-    if not is_admin_like(ctx.role):
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Apenas administradores")
+    _assert_staff_can_mutate_classroom(ctx)
     row = await fetch_one(
         db,
         """
@@ -653,8 +670,7 @@ async def remove_classroom_teacher_v1(
     db: Annotated[AsyncSession, Depends(get_db)],
 ):
     await _fetch_classroom_by_id_scoped(db, ctx, classroom_id)
-    if not is_admin_like(ctx.role):
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Apenas administradores")
+    _assert_staff_can_mutate_classroom(ctx)
     await execute(
         db,
         """

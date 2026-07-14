@@ -7,15 +7,18 @@ from app.v1 import directory_router
 
 @pytest.mark.asyncio
 async def test_create_user_with_profile_happy_path(monkeypatch):
-    calls = {"n": 0}
+    calls = {"n": 0, "profile_code": None, "auth_provider": None, "can_login": None}
 
-    async def fake_fetch_one(_db, sql, _params):
+    async def fake_fetch_one(_db, sql, params):
         if "RETURNING id" in sql and "INSERT INTO people" in sql:
+            calls["auth_provider"] = params.get("auth_provider")
+            calls["can_login"] = params.get("can_login")
             return {"id": "p1"}
         if "INSERT INTO profiles" in sql:
+            calls["profile_code"] = params.get("code")
             return {"id": "pr1"}
         if "FROM vw_profiles" in sql:
-            return {"id": "pr1", "role": "student", "person_id": "p1", "school_id": None}
+            return {"id": "pr1", "role": "student", "person_id": "p1", "school_id": None, "code": "RA123"}
         return {"ok": True}
 
     async def fake_execute(_db, _sql, _params):
@@ -32,11 +35,15 @@ async def test_create_user_with_profile_happy_path(monkeypatch):
         full_name="A",
         email="a@a.com",
         role="student",
+        code="RA123",
         create_firebase_user=False,
     )
     out = await directory_router._create_user_with_profile(DummyDB(), body=body)
     assert out["id"] == "pr1"
     assert calls["n"] == 0
+    assert calls["profile_code"] == "RA123"
+    assert calls["auth_provider"] == "database"
+    assert calls["can_login"] is False
 
 
 @pytest.mark.asyncio
@@ -78,6 +85,25 @@ async def test_users_import_collects_errors(monkeypatch):
     assert out["ok"] is False
     assert len(out["created"]) == 1
     assert len(out["errors"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_dict_csv_row_to_user_create_respects_default_firebase_flag():
+    row = {
+        "full_name": "Aluno",
+        "email": "aluno@example.com",
+        "role": "STUDENT",
+        "school_id": str(uuid.uuid4()),
+    }
+    body = directory_router._dict_csv_row_to_user_create(row, default_create_firebase_user=False)
+    assert body.create_firebase_user is False
+
+    row["create_firebase_user"] = "true"
+    body_override = directory_router._dict_csv_row_to_user_create(
+        row,
+        default_create_firebase_user=False,
+    )
+    assert body_override.create_firebase_user is True
 
 
 @pytest.mark.asyncio
